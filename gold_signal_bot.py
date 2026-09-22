@@ -31,16 +31,20 @@ ENTRY_RANGE_ATR_MULT = 0.3
 SL_ATR_MULT = 1.5
 TP_ATR_MULT = 2.5
 
+HTF_INTERVAL = "1h"  # higher timeframe used for trend context
+
 NEWS_BUFFER_MIN = 30  # flag caution if a high-impact USD event is within +/- this many minutes
 NEWS_FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 
-def fetch_candles():
+def fetch_candles(interval=None, outputsize=None):
+    interval = interval or INTERVAL
+    outputsize = outputsize or OUTPUT_SIZE
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "outputsize": OUTPUT_SIZE,
+        "interval": interval,
+        "outputsize": outputsize,
         "apikey": TWELVEDATA_API_KEY,
         "timezone": "UTC",
     }
@@ -50,11 +54,12 @@ def fetch_candles():
         raise RuntimeError(f"TwelveData error: {data}")
     # API returns newest-first; reverse to chronological order
     values = list(reversed(data["values"]))
+    opens = [float(v["open"]) for v in values]
     closes = [float(v["close"]) for v in values]
     highs = [float(v["high"]) for v in values]
     lows = [float(v["low"]) for v in values]
     times = [v["datetime"] for v in values]
-    return times, highs, lows, closes
+    return times, opens, highs, lows, closes
 
 
 def ema(values, period):
@@ -111,6 +116,138 @@ def atr(highs, lows, closes, period):
     return result
 
 
+def find_last_swing_high(highs, up_to_index, lookback=5):
+    """Most recent fractal swing high strictly before up_to_index."""
+    for k in range(up_to_index - lookback, lookback - 1, -1):
+        window = highs[k - lookback:k + lookback + 1]
+        if window and highs[k] == max(window):
+            return k, highs[k]
+    return None, None
+
+
+def find_last_swing_low(lows, up_to_index, lookback=5):
+    """Most recent fractal swing low strictly before up_to_index."""
+    for k in range(up_to_index - lookback, lookback - 1, -1):
+        window = lows[k - lookback:k + lookback + 1]
+        if window and lows[k] == min(window):
+            return k, lows[k]
+    return None, None
+
+
+def detect_structure(highs, lows, closes, i, lookback=5):
+    """
+    Simple SMC-style break of structure (BOS) check:
+    bullish BOS = current close breaks above the last swing high
+    bearish BOS = current close breaks below the last swing low
+    This is descriptive context, not a prediction.
+    """
+    sh_idx, sh_val = find_last_swing_high(highs, i - lookback, lookback)
+    sl_idx, sl_val = find_last_swing_low(lows, i - lookback, lookback)
+
+    bos_bull = sh_val is not None and closes[i] > sh_val
+    bos_bear = sl_val is not None and closes[i] < sl_val
+    return bos_bull, bos_bear, sh_val, sl_val
+
+
+def find_nearest_unfilled_fvg(highs, lows, closes, i, lookback=100):
+    """
+    Classic 3-candle Fair Value Gap: a price gap between candle (k-2) and
+    candle k that the market has not traded back through since. Returns the
+    gap closest to the current price, or None.
+    """
+    start = max(2, i - lookback)
+    gaps = []
+    for k in range(start, i + 1):
+        if lows[k] > highs[k - 2]:
+            gaps.append({"type": "bullish", "low": highs[k - 2], "high": lows[k], "index": k})
+        elif highs[k] < lows[k - 2]:
+            gaps.append({"type": "bearish", "low": highs[k], "high": lows[k - 2], "index": k})
+
+    unfilled = []
+    for g in gaps:
+        filled = False
+        for j in range(g["index"] + 1, i + 1):
+            if lows[j] <= g["high"] and highs[j] >= g["low"]:
+                filled = True
+                break
+        if not filled:
+            unfilled.append(g)
+
+    if not unfilled:
+        return None
+    price_now = closes[i]
+    return min(unfilled, key=lambda g: abs(price_now - (g["low"] + g["high"]) / 2))
+
+
+def detect_liquidity_sweep(highs, lows, closes, i, lookback=5):
+    """
+    A 'sweep': price wicks beyond a recent swing high/low (grabbing resting
+    stop orders) then closes back on the other side of it — a common SMC
+    reversal cue.
+    """
+    sh_idx, sh_val = find_last_swing_high(highs, i - lookback, lookback)
+    sl_idx, sl_val = find_last_swing_low(lows, i - lookback, lookback)
+
+    swept_high = sh_val is not None and highs[i] > sh_val and closes[i] < sh_val
+    swept_low = sl_val is not None and lows[i] < sl_val and closes[i] > sl_val
+    return swept_high, swept_low, sh_val, sl_val
+
+
+def find_last_order_block(opens, highs, lows, closes, atr_vals, i, impulse_mult=1.5, lookback=40):
+    """
+    A simple order block definition: the last opposing candle immediately
+    before a strong impulsive move (range > impulse_mult * ATR). Returns the
+    zone (that candle's high/low), or None if nothing qualifies nearby.
+    """
+    start = max(1, i - lookback)
+    for k in range(i, start, -1):
+        if atr_vals[k] is None:
+            continue
+        candle_range = abs(closes[k] - opens[k])
+        if candle_range <= impulse_mult * atr_vals[k]:
+            continue
+        impulsive_up = closes[k] > opens[k]
+        j = k - 1
+        if j < 0:
+            continue
+        opposing_down = closes[j] < opens[j]
+        opposing_up = closes[j] > opens[j]
+        if impulsive_up and opposing_down:
+            return {"type": "bullish", "low": lows[j], "high": highs[j], "index": j}
+        if (not impulsive_up) and opposing_up:
+            return {"type": "bearish", "low": lows[j], "high": highs[j], "index": j}
+    return None
+
+
+def premium_discount_zone(highs, lows, i, lookback=50):
+    """
+    Splits the recent trading range in half. SMC convention: the lower half
+    is a 'discount' (buyers favored), the upper half a 'premium' (sellers
+    favored). Purely descriptive of where price sits in its recent range.
+    """
+    start = max(0, i - lookback)
+    recent_high = max(highs[start:i + 1])
+    recent_low = min(lows[start:i + 1])
+    midpoint = (recent_high + recent_low) / 2
+    return recent_high, recent_low, midpoint
+
+
+def fetch_htf_trend():
+    """Higher-timeframe (1h) EMA trend, for multi-timeframe context."""
+    try:
+        _, _, htf_highs, htf_lows, htf_closes = fetch_candles(interval=HTF_INTERVAL, outputsize=250)
+    except Exception as e:
+        print(f"HTF fetch failed, skipping HTF context: {e}")
+        return None
+
+    htf_fast = ema(htf_closes, EMA_FAST)
+    htf_slow = ema(htf_closes, EMA_SLOW)
+    j = len(htf_closes) - 1
+    if htf_fast[j] is None or htf_slow[j] is None:
+        return None
+    return "up" if htf_fast[j] > htf_slow[j] else "down"
+
+
 def is_news_window(buffer_minutes):
     try:
         resp = requests.get(NEWS_FEED_URL, timeout=15)
@@ -142,7 +279,7 @@ def send_telegram(message):
 
 
 def main():
-    times, highs, lows, closes = fetch_candles()
+    times, opens, highs, lows, closes = fetch_candles()
     if len(closes) < EMA_SLOW + 5:
         print("Not enough candle history yet, skipping this run.")
         return
@@ -196,15 +333,60 @@ def main():
 
     news_flag, news_title = is_news_window(NEWS_BUFFER_MIN)
 
+    bos_bull, bos_bear, swing_high, swing_low = detect_structure(highs, lows, closes, i)
+    if bos_bull:
+        structure_note = "bullish break of structure (price closed above recent swing high)"
+    elif bos_bear:
+        structure_note = "bearish break of structure (price closed below recent swing low)"
+    else:
+        structure_note = "no confirmed break of recent structure yet"
+
+    nearest_fvg = find_nearest_unfilled_fvg(highs, lows, closes, i)
+
+    swept_high, swept_low, sh_val, sl_val = detect_liquidity_sweep(highs, lows, closes, i)
+    if swept_high:
+        sweep_note = f"recent liquidity sweep above {sh_val:.2f} (swept then rejected)"
+    elif swept_low:
+        sweep_note = f"recent liquidity sweep below {sl_val:.2f} (swept then rejected)"
+    else:
+        sweep_note = None
+
+    order_block = find_last_order_block(opens, highs, lows, closes, atr_vals, i)
+
+    recent_high, recent_low, midpoint = premium_discount_zone(highs, lows, i)
+    zone_label = "premium (upper half of recent range)" if close_now > midpoint else "discount (lower half of recent range)"
+
+    htf_trend = fetch_htf_trend()
+
     message = (
         f"XAU/USD {direction} zone\n"
         f"Zone: {entry_low:.2f} - {entry_high:.2f}\n"
         f"SL: {sl:.2f}   TP: {tp:.2f}\n"
         f"Time: {times[i]} UTC\n"
+        f"\nStructure: {structure_note}\n"
     )
+    if nearest_fvg:
+        message += (
+            f"Nearby unfilled FVG ({nearest_fvg['type']}): "
+            f"{nearest_fvg['low']:.2f} - {nearest_fvg['high']:.2f}\n"
+        )
+    if sweep_note:
+        message += f"Liquidity: {sweep_note}\n"
+    if order_block:
+        message += (
+            f"Order block ({order_block['type']}): "
+            f"{order_block['low']:.2f} - {order_block['high']:.2f}\n"
+        )
+    message += f"Price sits in {zone_label} (range {recent_low:.2f} - {recent_high:.2f})\n"
+    if htf_trend:
+        agreement = "agrees with" if (htf_trend == "up" and signal == 1) or (htf_trend == "down" and signal == -1) else "conflicts with"
+        message += f"1H trend: {htf_trend} ({agreement} this signal)\n"
     if news_flag:
         message += f"\n⚠️ CAUTION: high-impact USD news nearby ({news_title})\n"
-    message += "\n(Guidance only — no trade placed automatically.)"
+    message += (
+        "\n(Guidance only — structure/FVG/order blocks/sweeps are added context, "
+        "not a prediction. No trade placed automatically.)"
+    )
 
     print(message)
     send_telegram(message)
