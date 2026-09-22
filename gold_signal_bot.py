@@ -42,6 +42,7 @@ def fetch_candles():
         "interval": INTERVAL,
         "outputsize": OUTPUT_SIZE,
         "apikey": TWELVEDATA_API_KEY,
+        "timezone": "UTC",
     }
     resp = requests.get(url, params=params, timeout=20)
     data = resp.json()
