@@ -35,6 +35,8 @@ ENTRY_RANGE_ATR_MULT = 0.3
 SL_ATR_MULT = 1.5
 TP_ATR_MULT = 2.5
 
+MOMENTUM_SPIKE_ATR_MULT = 2.0  # single-candle move this many x ATR = independent "sharp move" trigger
+
 HTF_INTERVAL = "1h"  # higher timeframe used for trend context
 
 NEWS_BUFFER_MIN = 30  # flag caution if a high-impact USD event is within +/- this many minutes
@@ -284,6 +286,86 @@ def fetch_htf_trend():
     return "up" if htf_fast[j] > htf_slow[j] else "down"
 
 
+def detect_momentum_spike(opens, closes, atr_vals, i, spike_mult=MOMENTUM_SPIKE_ATR_MULT):
+    """
+    Independent fast trigger: fires when a single candle's move is unusually
+    large relative to recent volatility (ATR), regardless of whether the
+    slower EMA crossover has caught up yet. Catches sharp reversals sooner,
+    at the cost of being noisier than the EMA/RSI trigger.
+    """
+    if atr_vals[i] is None:
+        return None
+    move = closes[i] - opens[i]
+    if abs(move) >= spike_mult * atr_vals[i]:
+        return "bullish" if move > 0 else "bearish"
+    return None
+
+
+def find_equal_levels(values, i, lookback=50, tolerance=0.0008, mode="high"):
+    """
+    ICT-style 'equal highs/lows': two or more recent local peaks (or troughs)
+    sitting within `tolerance` (as a fraction of price) of each other —
+    treated as a resting liquidity pool the market may be drawn back to.
+    """
+    start = max(0, i - lookback)
+    window = values[start:i + 1]
+    if len(window) < 3:
+        return None
+
+    extremes = []
+    for k in range(1, len(window) - 1):
+        if mode == "high" and window[k] >= window[k - 1] and window[k] >= window[k + 1]:
+            extremes.append(window[k])
+        elif mode == "low" and window[k] <= window[k - 1] and window[k] <= window[k + 1]:
+            extremes.append(window[k])
+
+    if len(extremes) < 2:
+        return None
+
+    extremes_sorted = sorted(extremes, reverse=(mode == "high"))
+    anchor = extremes_sorted[0]
+    for v in extremes_sorted[1:]:
+        if anchor != 0 and abs(anchor - v) / abs(anchor) <= tolerance:
+            return (anchor + v) / 2
+    return None
+
+
+def get_killzone(time_str):
+    """ICT session windows (UTC) considered higher-probability for real moves."""
+    dt = datetime.datetime.fromisoformat(time_str)
+    hour = dt.hour
+    if 7 <= hour < 10:
+        return "London killzone"
+    if 12 <= hour < 15:
+        return "New York killzone"
+    return None
+
+
+def compute_ote_zone(highs, lows, i, lookback=5):
+    """
+    ICT Optimal Trade Entry: the 61.8%-79% Fibonacci retracement zone of the
+    most recent swing leg — a specific pullback area ICT traders watch for
+    entries in the direction of that leg.
+    """
+    sh_idx, sh_val = find_last_swing_high(highs, i, lookback)
+    sl_idx, sl_val = find_last_swing_low(lows, i, lookback)
+    if sh_val is None or sl_val is None or sh_idx is None or sl_idx is None:
+        return None
+    rng = sh_val - sl_val
+    if rng <= 0:
+        return None
+    if sh_idx > sl_idx:
+        # leg ran low -> high: OTE is a discount pullback zone for buys
+        low_bound = sh_val - rng * 0.79
+        high_bound = sh_val - rng * 0.618
+        return {"type": "bullish (pullback buy zone)", "low": low_bound, "high": high_bound}
+    else:
+        # leg ran high -> low: OTE is a premium pullback zone for sells
+        low_bound = sl_val + rng * 0.618
+        high_bound = sl_val + rng * 0.79
+        return {"type": "bearish (pullback sell zone)", "low": low_bound, "high": high_bound}
+
+
 def is_news_window(buffer_minutes):
     try:
         resp = requests.get(NEWS_FEED_URL, timeout=15)
@@ -346,10 +428,20 @@ def main():
     rsi_bounce_down = rsi_vals[prev] >= RSI_OVERBOUGHT and rsi_vals[i] < RSI_OVERBOUGHT
 
     signal = 0
+    trigger_type = "trend"
     if bull_cross or (trend_up and rsi_bounce_up):
         signal = 1
     elif bear_cross or (trend_down and rsi_bounce_down):
         signal = -1
+
+    if signal == 0:
+        spike = detect_momentum_spike(opens, closes, atr_vals, i)
+        if spike == "bullish":
+            signal = 1
+            trigger_type = "momentum spike"
+        elif spike == "bearish":
+            signal = -1
+            trigger_type = "momentum spike"
 
     if signal == 0:
         print(f"No signal at {times[i]}. Trend up={trend_up}, RSI={rsi_vals[i]:.1f}")
@@ -406,8 +498,14 @@ def main():
 
     htf_trend = fetch_htf_trend()
 
+    killzone = get_killzone(times[i])
+    eq_high = find_equal_levels(highs, i, mode="high")
+    eq_low = find_equal_levels(lows, i, mode="low")
+    ote = compute_ote_zone(highs, lows, i)
+
     message = (
         f"XAU/USD {direction} zone\n"
+        f"Trigger: {trigger_type}\n"
         f"Zone: {entry_low:.2f} - {entry_high:.2f}\n"
         f"SL: {sl:.2f}   TP: {tp:.2f}\n"
         f"Time: {times[i]} UTC\n"
@@ -429,6 +527,16 @@ def main():
     if htf_trend:
         agreement = "agrees with" if (htf_trend == "up" and signal == 1) or (htf_trend == "down" and signal == -1) else "conflicts with"
         message += f"1H trend: {htf_trend} ({agreement} this signal)\n"
+    if killzone:
+        message += f"Session: {killzone}\n"
+    else:
+        message += "Session: outside main London/New York killzones\n"
+    if eq_high:
+        message += f"Equal highs (liquidity pool) near {eq_high:.2f}\n"
+    if eq_low:
+        message += f"Equal lows (liquidity pool) near {eq_low:.2f}\n"
+    if ote:
+        message += f"OTE zone {ote['type']}: {ote['low']:.2f} - {ote['high']:.2f}\n"
     if news_flag:
         message += f"\n⚠️ CAUTION: high-impact USD news nearby ({news_title})\n"
     message += (
