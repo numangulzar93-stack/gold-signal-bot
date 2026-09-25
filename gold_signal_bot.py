@@ -9,6 +9,7 @@ Gold (XAU/USD) signal guide bot.
 
 import os
 import sys
+import json
 import datetime
 import requests
 
@@ -19,10 +20,13 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "XAU/USD"
 INTERVAL = "15min"
+INTERVAL_MINUTES = 15
 OUTPUT_SIZE = 300  # enough bars for EMA(200) to stabilize
 
-EMA_FAST = 50
-EMA_SLOW = 200
+STATE_FILE = "state.json"  # persisted between runs via GitHub Actions cache
+
+EMA_FAST = 20
+EMA_SLOW = 50
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30.0
 RSI_OVERBOUGHT = 70.0
@@ -60,6 +64,38 @@ def fetch_candles(interval=None, outputsize=None):
     lows = [float(v["low"]) for v in values]
     times = [v["datetime"] for v in values]
     return times, opens, highs, lows, closes
+
+
+def drop_incomplete_candle(times, opens, highs, lows, closes, interval_minutes):
+    """
+    Some data providers include the still-forming current candle as the last
+    entry. Drop it if it hasn't finished yet, so we only ever act on fully
+    closed candles (prevents re-firing the same signal as that candle updates).
+    """
+    if not times:
+        return times, opens, highs, lows, closes
+    last_start = datetime.datetime.fromisoformat(times[-1]).replace(tzinfo=datetime.timezone.utc)
+    candle_end = last_start + datetime.timedelta(minutes=interval_minutes)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if now < candle_end:
+        return times[:-1], opens[:-1], highs[:-1], lows[:-1], closes[:-1]
+    return times, opens, highs, lows, closes
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"Could not write state file: {e}")
 
 
 def ema(values, period):
@@ -280,9 +316,14 @@ def send_telegram(message):
 
 def main():
     times, opens, highs, lows, closes = fetch_candles()
+    times, opens, highs, lows, closes = drop_incomplete_candle(
+        times, opens, highs, lows, closes, INTERVAL_MINUTES
+    )
     if len(closes) < EMA_SLOW + 5:
         print("Not enough candle history yet, skipping this run.")
         return
+
+    state = load_state()
 
     ema_fast = ema(closes, EMA_FAST)
     ema_slow = ema(closes, EMA_SLOW)
@@ -312,6 +353,7 @@ def main():
 
     if signal == 0:
         print(f"No signal at {times[i]}. Trend up={trend_up}, RSI={rsi_vals[i]:.1f}")
+        save_state(state)
         return
 
     close_now = closes[i]
@@ -330,6 +372,12 @@ def main():
         entry_high = close_now + half_width
         sl = close_now + atr_now * SL_ATR_MULT
         tp = close_now - atr_now * TP_ATR_MULT
+
+    candle_time = times[i]
+    if state.get("last_alert_time") == candle_time and state.get("last_alert_direction") == direction:
+        print(f"Already alerted this candle ({candle_time}, {direction}) — skipping duplicate.")
+        save_state(state)
+        return
 
     news_flag, news_title = is_news_window(NEWS_BUFFER_MIN)
 
@@ -390,6 +438,9 @@ def main():
 
     print(message)
     send_telegram(message)
+    state["last_alert_time"] = candle_time
+    state["last_alert_direction"] = direction
+    save_state(state)
 
 
 if __name__ == "__main__":
