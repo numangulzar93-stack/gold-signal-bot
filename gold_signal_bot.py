@@ -1,5 +1,24 @@
 """
-Gold (XAU/USD) signal guide bot — v5.1
+Gold (XAU/USD) signal guide bot — v5.2
+
+NEW in v5.2 (everything else is identical to v5.1): a TREND-CONTINUATION
+PULLBACK trigger, so a long trend is no longer missed just because the EMA cross
+happened hours ago and the overextension filter blocks chasing.
+
+  Trigger = "pullback". In an established trend (EMA20 on the trend side of
+  EMA50 for 10+ candles, EMA50 sloping with the trend, price on the trend side
+  of EMA50, all inside the current session segment) the bot waits for price to:
+    1. make a leg (>= 4 ATR) and then a counter-trend bounce (>= 1.5 ATR and
+       <= 78.6% of the leg) that fails to reclaim EMA50, then
+    2. print a rejection/resumption candle in the trend direction that closes
+       beyond the previous candle's extreme.
+  It uses a structure-based stop just beyond the bounce extreme (capped at
+  4 ATR, otherwise the signal is skipped as a late entry), and the same HTF
+  enforcement, cooldown, latency, confluence, TP1/TP2, trailing plan and
+  paper tracker as every other trigger. The overextension limit is looser for
+  this trigger (6 ATR) because a retrace entry is not a chase.
+
+--- v5.1 notes (unchanged) ---
 
 Builds on v5 (market-hours gate, stale-feed check, ATR/SL/TP floors, HTF
 enforcement, FVG size filter, confluence score). New in v5.1, marked "# NEW:"
@@ -116,6 +135,22 @@ LATENCY_FLAG_MIN = 5
 LATENCY_SUPPRESS_MIN = 20
 TRACK_MAX_CANDLES = 96          # 24h of 15m candles, then a tracked signal expires
 SEND_OUTCOME_MESSAGES = True
+
+# ---- NEW v5.2: trend-continuation pullback trigger ----
+PULLBACK_ENABLED = True
+PULLBACK_MIN_SEGMENT_CANDLES = 20   # need this many candles since the last session break
+PULLBACK_TREND_MIN_CANDLES = 10     # EMA fast must stay on the trend side of EMA slow this long
+PULLBACK_SLOPE_CANDLES = 5          # EMA slow must slope with the trend over this many candles
+PULLBACK_LOW_WINDOW = 24            # candles scanned for the leg extreme before the current candle
+PULLBACK_LEG_LOOKBACK = 30          # candles before the leg extreme used to find the leg start
+PULLBACK_MIN_BOUNCE_ATR = 1.5       # counter-trend bounce must be at least this many ATR
+PULLBACK_MIN_LEG_ATR = 4.0          # the leg being retraced must be at least this many ATR
+PULLBACK_MAX_RETRACE = 0.786        # deeper than this = likely reversal, not a pullback
+PULLBACK_MIN_BODY_ATR = 0.25        # confirmation candle body must be at least this many ATR
+PULLBACK_SL_BUFFER_ATR = 0.25       # stop sits this far beyond the bounce extreme
+PULLBACK_MIN_SL_ATR = 1.0           # stop distance floor (in ATR)
+PULLBACK_MAX_SL_ATR = 4.0           # stop wider than this = late entry, skip
+PULLBACK_OVEREXTENSION_ATR_MULT = 6.0  # looser overextension limit for pullback entries
 
 LOG_FIELDS = [
     "event", "time_utc", "direction", "trigger", "entry", "sl", "tp1", "tp2",
@@ -571,6 +606,66 @@ def compute_confluence(signal, bos_bull, bos_bear, nearest_fvg, order_block,
 # ---------------------------------------------------------------------------
 # NEW v5.1 helpers
 # ---------------------------------------------------------------------------
+def detect_pullback_entry(opens, highs, lows, closes, ema_fast, ema_slow, atr_vals, i):
+    """
+    NEW v5.2. Detect a DOWN-trend continuation (sell-side) pullback that just
+    resumed on candle i. For an up-trend the caller passes mirrored (negated)
+    data, so the same logic serves both directions.
+
+    Returns a dict (values in the passed-in price space) or None:
+      leg_start  - high of the leg being retraced
+      leg_end    - low of that leg (the extreme before the bounce)
+      pb_extreme - high of the counter-trend bounce
+      bounce, leg_height, retrace
+    """
+    atr_now = atr_vals[i]
+    need = max(PULLBACK_TREND_MIN_CANDLES, PULLBACK_SLOPE_CANDLES + 1, 8)
+    if atr_now is None or i < need:
+        return None
+
+    # 1) established trend, inside this session segment
+    for k in range(i - PULLBACK_TREND_MIN_CANDLES + 1, i + 1):
+        if ema_fast[k] is None or ema_slow[k] is None or not (ema_fast[k] < ema_slow[k]):
+            return None
+    if ema_slow[i - PULLBACK_SLOPE_CANDLES] is None or not (ema_slow[i] < ema_slow[i - PULLBACK_SLOPE_CANDLES]):
+        return None
+    if closes[i] >= ema_slow[i]:
+        return None
+
+    # 2) the leg extreme (lowest low before the current candle) and the bounce after it
+    lo_start = max(0, i - PULLBACK_LOW_WINDOW)
+    window = lows[lo_start:i]
+    if len(window) < 4:
+        return None
+    leg_end = min(window)
+    j = lo_start + max(n for n, v in enumerate(window) if v == leg_end)  # latest occurrence
+    if i - j < 3:  # need at least two bounce candles between the extreme and now
+        return None
+
+    pb_extreme = max(highs[j + 1:i])
+    bounce = pb_extreme - leg_end
+    if bounce < PULLBACK_MIN_BOUNCE_ATR * atr_now:
+        return None
+    if pb_extreme > ema_slow[i] + 0.5 * atr_now:  # bounce reclaimed the slow EMA = trend weakening
+        return None
+
+    leg_start = max(highs[max(0, j - PULLBACK_LEG_LOOKBACK):j + 1])
+    leg_height = leg_start - leg_end
+    if leg_height < PULLBACK_MIN_LEG_ATR * atr_now:
+        return None
+    retrace = bounce / leg_height
+    if retrace > PULLBACK_MAX_RETRACE:
+        return None
+
+    # 3) confirmation: trend-direction candle that closes beyond the prior candle's low
+    body = opens[i] - closes[i]
+    if not (closes[i] < opens[i] and closes[i] < lows[i - 1] and body >= PULLBACK_MIN_BODY_ATR * atr_now):
+        return None
+
+    return {"leg_start": leg_start, "leg_end": leg_end, "pb_extreme": pb_extreme,
+            "bounce": bounce, "leg_height": leg_height, "retrace": retrace}
+
+
 def zone_distance(price, low, high):
     if low <= price <= high:
         return 0.0
@@ -781,6 +876,12 @@ def run(state, now_utc):
     seg_len = i - seg_start + 1
     prev_contiguous = prev >= seg_start
 
+    # segment-only views (used by the pullback trigger and the SMC context)
+    s_o, s_h, s_l, s_c = opens[seg_start:], highs[seg_start:], lows[seg_start:], closes[seg_start:]
+    s_atr = atr_vals[seg_start:]
+    s_ef, s_es = ema_fast[seg_start:], ema_slow[seg_start:]
+    s_i = len(s_c) - 1
+
     trend_up = ema_fast[i] > ema_slow[i]
     trend_down = ema_fast[i] < ema_slow[i]
     bull_cross = ema_fast[prev] <= ema_slow[prev] and ema_fast[i] > ema_slow[i]
@@ -797,6 +898,27 @@ def run(state, now_utc):
             signal = 1
         elif bear_cross or (trend_down and rsi_bounce_down):
             signal = -1
+
+    # NEW v5.2: trend-continuation pullback (checked before the momentum spike,
+    # because it is a better-located entry than chasing a spike)
+    pullback = None
+    if signal == 0 and PULLBACK_ENABLED and seg_len >= PULLBACK_MIN_SEGMENT_CANDLES:
+        info = detect_pullback_entry(s_o, s_h, s_l, s_c, s_ef, s_es, s_atr, s_i)
+        if info:
+            signal = -1
+            pullback = info
+        else:
+            neg = lambda arr: [(-x if x is not None else None) for x in arr]
+            # mirrored data: buy-side pullback == sell-side pullback on negated prices
+            m = detect_pullback_entry(neg(s_o), neg(s_l), neg(s_h), neg(s_c),
+                                      neg(s_ef), neg(s_es), s_atr, s_i)
+            if m:
+                signal = 1
+                pullback = {"leg_start": -m["leg_start"], "leg_end": -m["leg_end"],
+                            "pb_extreme": -m["pb_extreme"], "bounce": m["bounce"],
+                            "leg_height": m["leg_height"], "retrace": m["retrace"]}
+        if signal != 0:
+            trigger_type = "pullback"
 
     if signal == 0:
         spike = detect_momentum_spike(opens, closes, atr_vals, i)
@@ -815,10 +937,11 @@ def run(state, now_utc):
     # NEW: overextension filter (chasing)
     if OVEREXTENSION_ACTION != "off":
         ext = ((closes[i] - ema_fast[i]) if signal == 1 else (ema_fast[i] - closes[i])) / atr_now
-        if ext > OVEREXTENSION_ATR_MULT:
+        ext_limit = PULLBACK_OVEREXTENSION_ATR_MULT if trigger_type == "pullback" else OVEREXTENSION_ATR_MULT
+        if ext > ext_limit:
             if OVEREXTENSION_ACTION == "suppress":
                 print(f"{direction} suppressed: price is {ext:.1f} ATR from EMA{EMA_FAST} "
-                      f"(limit {OVEREXTENSION_ATR_MULT}) — overextended, likely chasing.")
+                      f"(limit {ext_limit}) — overextended, likely chasing.")
                 return
             flags.append(f"overextended: {ext:.1f} ATR from EMA{EMA_FAST}")
 
@@ -850,7 +973,7 @@ def run(state, now_utc):
         return
 
     htf_trend = fetch_htf_trend()
-    if (REQUIRE_HTF_AGREEMENT_FOR_TREND_SIGNALS and trigger_type == "trend" and htf_trend is not None):
+    if (REQUIRE_HTF_AGREEMENT_FOR_TREND_SIGNALS and trigger_type in ("trend", "pullback") and htf_trend is not None):
         if (htf_trend == "up" and signal == -1) or (htf_trend == "down" and signal == 1):
             print(f"Trend-trigger {direction} conflicts with 1H trend ({htf_trend}) — suppressed.")
             return
@@ -861,6 +984,13 @@ def run(state, now_utc):
 
     sl_distance = max(atr_now * SL_ATR_MULT, MIN_SL_DOLLARS)
     tp1_distance = max(atr_now * TP_ATR_MULT, MIN_TP_DOLLARS)
+    if pullback is not None:  # NEW v5.2: stop just beyond the bounce extreme
+        sl_distance = max(abs(pullback["pb_extreme"] - close_now) + PULLBACK_SL_BUFFER_ATR * atr_now,
+                          MIN_SL_DOLLARS, PULLBACK_MIN_SL_ATR * atr_now)
+        if sl_distance > PULLBACK_MAX_SL_ATR * atr_now:
+            print(f"Pullback {direction} skipped: structural stop {sl_distance:.1f} pts is "
+                  f"{sl_distance / atr_now:.1f} ATR away (limit {PULLBACK_MAX_SL_ATR}) — late entry.")
+            return
     if tp1_distance / sl_distance < MIN_RR_TP1:  # NEW: R:R floor
         tp1_distance = sl_distance * MIN_RR_TP1
 
@@ -872,9 +1002,6 @@ def run(state, now_utc):
     news_flag, news_title = is_news_window(NEWS_BUFFER_MIN)
 
     # ---- NEW: SMC context computed on the current session segment only ----
-    s_o, s_h, s_l, s_c = opens[seg_start:], highs[seg_start:], lows[seg_start:], closes[seg_start:]
-    s_atr = atr_vals[seg_start:]
-    s_i = len(s_c) - 1
 
     bos_bull, bos_bear, _, _ = detect_structure(s_h, s_l, s_c, s_i)
     if bos_bull:
@@ -954,9 +1081,10 @@ def run(state, now_utc):
         if (htf_trend == "up" and signal == -1) or (htf_trend == "down" and signal == 1):
             counter_trend_note = " (counter-trend spike)"
 
+    trigger_label = "trend-continuation pullback" if pullback else trigger_type
     message = (
         f"XAU/USD {direction} zone{counter_trend_note}\n"
-        f"Trigger: {trigger_type}\n"
+        f"Trigger: {trigger_label}\n"
         f"Zone: {entry_low:.2f} - {entry_high:.2f}\n"
         f"SL: {sl:.2f}   TP1: {tp1:.2f} ({rr1:.1f}R)   TP2: {tp2:.2f} ({rr2:.1f}R, {tp2_source})\n"
         f"Plan: at TP1 move SL to entry; then trail ~{trail:.1f} pts behind price toward TP2\n"
@@ -966,6 +1094,10 @@ def run(state, now_utc):
     )
     if flags:
         message += "Flags: " + "; ".join(flags) + "\n"
+    if pullback:
+        message += (f"Pullback: bounced {pullback['bounce']:.1f} pts ({pullback['retrace'] * 100:.0f}% of the "
+                    f"{pullback['leg_height']:.1f}-pt leg), rejected near {pullback['pb_extreme']:.2f}; "
+                    f"SL sits just beyond that level\n")
     message += f"\nStructure: {structure_note}\n"
     if nearest_fvg:
         message += (f"Nearby unfilled FVG ({nearest_fvg['type']}): "
