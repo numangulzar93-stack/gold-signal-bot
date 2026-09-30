@@ -1,5 +1,73 @@
 """
-Gold (XAU/USD) signal guide bot — v5.2
+Gold (XAU/USD) signal guide bot — v5.5
+
+NEW in v5.5 (built on v5.4, no removals): "don't miss opportunities" mode.
+Every signal that clears basic data-quality checks is now sent — nothing is
+silently withheld for being low-confidence, overextended, against 1H trend,
+fighting a recent sweep/reclaim, or inside a cooldown window. Those checks
+still run and still matter, but they now FLAG the message instead of
+suppressing it, and they feed a single visible label:
+
+    Setup strength: STRONG | MEDIUM | WEAK
+
+computed from confluence (structure/FVG/order block/sweep/1H trend, with the
+opposing-order-block penalty from v5.4) minus a point each for: fighting a
+recent liquidity sweep, fighting a recent structure reclaim, being
+overextended from EMA20, or a trend/pullback signal conflicting with the 1H
+trend. You get every signal, with a clear read on which ones deserve
+caution, and you apply your own judgment on top (SMC/ICT context — FVG,
+order blocks, sweeps, structure, premium/discount, OTE, equal levels, S/R
+levels — is still included in every message for that).
+
+Still hard-suppressed (these are data-quality gates, not opportunity calls):
+market closed, frozen/stale feed, indicators not warmed up, ATR too low,
+recent range too tight/unreliable, exact duplicate alert on the same candle,
+and a new signal whose zone overlaps an already-open unresolved signal in
+the same direction (that isn't a new opportunity — it's the same one).
+
+--- v5.4 notes (unchanged; the mechanisms below are now flag-only via the
+config flips just below, not removed) ---
+
+Accuracy fixes built on top of v5.2.1's logging, no removals): accuracy fixes
+requested after reviewing live signals that got wicked out or fought a
+reversal:
+
+  1. Wider, ATR-scaled pullback stop buffer (was a thin 0.25x ATR beyond the
+     rejection extreme; a live signal was stopped out by a wick that cleared
+     the entry zone but not the actual invalidation level). PULLBACK_SL_BUFFER_ATR
+     raised to 0.5.
+  2. Sweep-cooldown: when a liquidity sweep + rejection is detected within the
+     last SWEEP_COOLDOWN_CANDLES candles, trend/pullback (continuation)
+     signals AGAINST the direction implied by that sweep are suppressed. A
+     sweep-and-reject is itself a reversal signal; continuation signals
+     fighting it are the exact failure mode this closes.
+  3. Support/resistance levels + structure reclaim: recent swing highs/lows
+     are clustered into levels touched 2+ times. If price has reclaimed a
+     level it recently broke through (support -> resistance or vice versa),
+     continuation signals into the reclaimed side are suppressed, and the
+     level is shown in the message when relevant context (not suppressing).
+  4. Opposing order block is now a confluence PENALTY, not just a label. A
+     signal with an order block of the opposite type sitting on its entry
+     zone loses a confluence point instead of that being cosmetic.
+  5. Confidence tiers from the confluence score: LOW (<=2/5) is logged and
+     tracked for stats but NOT sent to Telegram; MEDIUM (3/5) is sent with a
+     "reduced confidence" flag; HIGH (4-5/5) sends as before.
+  6. Zone-overlap dedup: a new signal is suppressed as a duplicate if its
+     entry zone overlaps an existing UNRESOLVED same-direction signal by more
+     than DEDUP_OVERLAP_PCT, on top of the existing time-based cooldown/cap.
+  7. 15m/1H divergence note: if the 15m EMA20 slope points opposite the 1H
+     trend, this is now flagged in the message (informational; does not
+     suppress) so a turning lower-timeframe trend isn't silently ignored.
+
+--- v5.2.1 notes (unchanged) ---
+
+LOGGING ONLY. Nothing about when signals fire has changed by v5.2.1 itself. On every
+"No signal" run the log now also prints a "Pullback check:" line explaining
+why the pullback trigger did not fire (e.g. "bounce too small: 1.1 ATR (need
+1.5)"), plus the current ATR. Use these lines to tune the pullback thresholds
+from real runs instead of guessing.
+
+--- v5.2 notes ---
 
 NEW in v5.2 (everything else is identical to v5.1): a TREND-CONTINUATION
 PULLBACK trigger, so a long trend is no longer missed just because the EMA cross
@@ -115,11 +183,12 @@ SEGMENT_SHORT_ACTION = "flag"   # "flag" | "suppress" when segment is shorter th
 
 # ---- NEW v5.1: signal-quality config ----
 OVEREXTENSION_ATR_MULT = 3.5    # distance of close from EMA_FAST, in ATRs, in the signal direction
-OVEREXTENSION_ACTION = "suppress"  # "suppress" | "flag" | "off"
+OVEREXTENSION_ACTION = "flag"   # CHANGED v5.5 (was "suppress"): "flag" | "suppress" | "off"
 
-COOLDOWN_CANDLES = 4            # same-direction signals closer than this many candles are suppressed
+COOLDOWN_CANDLES = 4            # same-direction signals closer than this many candles are flagged
 WINDOW_CANDLES = 16             # rolling window for the per-direction cap
 MAX_SAME_DIRECTION_IN_WINDOW = 2
+COOLDOWN_ACTION = "flag"        # NEW v5.5: "flag" | "suppress" — was a hard suppress pre-v5.5
 
 MAX_CONTEXT_DISTANCE_ATR = 6.0  # FVG/OB/equal-level/OTE farther than this from price are dropped
 
@@ -133,8 +202,13 @@ TRAIL_ATR_MULT = 1.5
 # ---- NEW v5.1: latency + tracker ----
 LATENCY_FLAG_MIN = 5
 LATENCY_SUPPRESS_MIN = 20
+LATENCY_ACTION = "flag"         # NEW v5.5: "flag" | "suppress" — was a hard suppress pre-v5.5
 TRACK_MAX_CANDLES = 96          # 24h of 15m candles, then a tracked signal expires
 SEND_OUTCOME_MESSAGES = True
+
+# ---- NEW v5.5: HTF (1H) conflict for trend/pullback triggers ----
+HTF_CONFLICT_ACTION = "flag"    # CHANGED v5.5 (was a hard suppress via
+                                 # REQUIRE_HTF_AGREEMENT_FOR_TREND_SIGNALS): "flag" | "suppress"
 
 # ---- NEW v5.2: trend-continuation pullback trigger ----
 PULLBACK_ENABLED = True
@@ -147,14 +221,57 @@ PULLBACK_MIN_BOUNCE_ATR = 1.5       # counter-trend bounce must be at least this
 PULLBACK_MIN_LEG_ATR = 4.0          # the leg being retraced must be at least this many ATR
 PULLBACK_MAX_RETRACE = 0.786        # deeper than this = likely reversal, not a pullback
 PULLBACK_MIN_BODY_ATR = 0.25        # confirmation candle body must be at least this many ATR
-PULLBACK_SL_BUFFER_ATR = 0.25       # stop sits this far beyond the bounce extreme
+PULLBACK_SL_BUFFER_ATR = 0.5        # CHANGED v5.4 (was 0.25): stop sits this far beyond the
+                                     # bounce extreme — a thin buffer let a live signal get
+                                     # wicked out just past the entry zone, short of real invalidation
 PULLBACK_MIN_SL_ATR = 1.0           # stop distance floor (in ATR)
 PULLBACK_MAX_SL_ATR = 4.0           # stop wider than this = late entry, skip
 PULLBACK_OVEREXTENSION_ATR_MULT = 6.0  # looser overextension limit for pullback entries
 
+# ---- NEW v5.4: sweep cooldown ----
+SWEEP_COOLDOWN_ENABLED = True
+SWEEP_COOLDOWN_CANDLES = 6          # how far back to look for a sweep+reject
+SWEEP_COOLDOWN_ACTION = "flag"      # CHANGED v5.5 (was "suppress"): "flag" | "suppress"
+
+# ---- NEW v5.4: support/resistance levels + structure reclaim ----
+SR_ENABLED = True
+SR_LOOKBACK_CANDLES = 150           # how far back to look for swing highs/lows to cluster
+SR_SWING_LOOKBACK = 5               # fractal lookback used to find swing points
+SR_CLUSTER_TOL_ATR = 0.5            # swing points within this many ATR are the same level
+SR_MIN_TOUCHES = 2                  # a level needs at least this many touches to count
+SR_RECLAIM_LOOKBACK_CANDLES = 12    # how recently price must have been on the other side
+SR_RECLAIM_ACTION = "flag"          # CHANGED v5.5 (was "suppress"): "flag" | "suppress"
+
+# ---- NEW v5.4: opposing order block penalty ----
+OPPOSING_OB_PENALTY = 1             # confluence points subtracted for an opposing OB on the zone
+
+# ---- NEW v5.4/CHANGED v5.5: confidence tiers ----
+# v5.5: these no longer gate whether a signal is SENT (everything sends now)
+# — they only decide the visible STRONG/MEDIUM/WEAK label, computed later as
+# an ADJUSTED score (confluence minus sweep/reclaim/overextension/HTF
+# penalties). Kept here for reference/tuning.
+CONFLUENCE_LOW_MAX = 2
+CONFLUENCE_MEDIUM_MAX = 3
+
+# ---- NEW v5.4: zone-overlap dedup ----
+DEDUP_ENABLED = True
+DEDUP_OVERLAP_PCT = 0.5             # >= this fraction of zone overlap with an open same-direction
+                                     # signal = suppressed as a duplicate
+
+# ---- NEW v5.5: setup-strength label (STRONG/MEDIUM/WEAK) ----
+# adjusted_score = confluence aligned (0-5, already includes the opposing-OB
+# penalty) minus 1 point each for: fighting a recent sweep, fighting a recent
+# reclaim, overextension, HTF conflict (trend/pullback triggers only).
+STRENGTH_STRONG_MIN = 4    # adjusted_score >= this -> STRONG
+STRENGTH_MEDIUM_MIN = 2    # adjusted_score >= this (and < STRONG_MIN) -> MEDIUM
+                            # below STRENGTH_MEDIUM_MIN -> WEAK
+
+# ---- NEW v5.4: lower-timeframe / HTF divergence note ----
+LTF_SLOPE_CANDLES = 5               # candles used to judge the 15m EMA20 slope
+
 LOG_FIELDS = [
     "event", "time_utc", "direction", "trigger", "entry", "sl", "tp1", "tp2",
-    "confluence", "latency_min", "flags", "outcome", "candles_to_resolve",
+    "confluence", "confidence_tier", "latency_min", "flags", "outcome", "candles_to_resolve",
 ]
 
 
@@ -454,6 +571,118 @@ def detect_liquidity_sweep(highs, lows, closes, i, lookback=5):
     return swept_high, swept_low, sh_val, sl_val
 
 
+# NEW v5.4: recent sweep lookback (detect_liquidity_sweep above only checks
+# the current candle; this scans back several candles so a sweep from a
+# couple of bars ago can still gate the current signal)
+def find_recent_sweep(highs, lows, closes, i, candles_back=SWEEP_COOLDOWN_CANDLES, swing_lookback=5):
+    """
+    Returns the most recent sweep within `candles_back` candles of i, as
+    (kind, index, level) where kind is "high" (swept a high, bearish-for-
+    price-that-was-there / bullish rejection) or "low" (swept a low, bullish
+    rejection), or (None, None, None) if none found.
+    """
+    start = max(swing_lookback + 1, i - candles_back + 1)
+    best = (None, None, None)
+    for k in range(start, i + 1):
+        swept_high, swept_low, sh_val, sl_val = detect_liquidity_sweep(highs, lows, closes, k, swing_lookback)
+        if swept_high:
+            best = ("high", k, sh_val)
+        elif swept_low:
+            best = ("low", k, sl_val)
+    return best
+
+
+# NEW v5.4: support/resistance level clustering
+def find_sr_levels(highs, lows, i, atr_now, lookback=SR_LOOKBACK_CANDLES,
+                   swing_lookback=SR_SWING_LOOKBACK, tol_atr=SR_CLUSTER_TOL_ATR,
+                   min_touches=SR_MIN_TOUCHES):
+    """
+    Cluster recent fractal swing highs/lows into horizontal levels. A level
+    is kept only if at least `min_touches` swing points (from either highs or
+    lows, since old support often becomes resistance) fall within tol_atr of
+    each other. Returns a list of dicts: {"price": avg, "touches": n}.
+    """
+    start = max(0, i - lookback)
+    points = (find_swing_levels(highs[start:i + 1], "high", swing_lookback) +
+              find_swing_levels(lows[start:i + 1], "low", swing_lookback))
+    if not points:
+        return []
+    tol = max(tol_atr * atr_now, 0.01)
+    points.sort()
+    clusters = []
+    current = [points[0]]
+    for p in points[1:]:
+        if p - current[-1] <= tol:
+            current.append(p)
+        else:
+            clusters.append(current)
+            current = [p]
+    clusters.append(current)
+    levels = [{"price": sum(c) / len(c), "touches": len(c)} for c in clusters if len(c) >= min_touches]
+    return levels
+
+
+# NEW v5.4: nearest S/R level to current price (for context/messaging)
+def nearest_sr_level(levels, price, max_distance_atr, atr_now):
+    if not levels:
+        return None
+    lvl = min(levels, key=lambda L: abs(L["price"] - price))
+    if abs(lvl["price"] - price) > max_distance_atr * atr_now:
+        return None
+    return lvl
+
+
+# NEW v5.4: structure reclaim — did price recently sit on the other side of a
+# known level and has now closed back across it?
+def detect_level_reclaim(levels, closes, i, atr_now, lookback=SR_RECLAIM_LOOKBACK_CANDLES,
+                         min_gap_atr=0.15):
+    """
+    Returns a dict {"level": price, "direction": "bullish"|"bearish"} for the
+    most significant recent reclaim, or None. "bullish" means price was
+    below the level within `lookback` candles and has now closed above it
+    (old resistance likely flipping to support) — this argues AGAINST fresh
+    SELL continuation signals near that level. "bearish" is the mirror.
+    """
+    if not levels:
+        return None
+    start = max(0, i - lookback)
+    min_gap = min_gap_atr * atr_now
+    best = None
+    for lvl in levels:
+        p = lvl["price"]
+        was_below = any(c < p - min_gap for c in closes[start:i])
+        was_above = any(c > p + min_gap for c in closes[start:i])
+        now_above = closes[i] > p + min_gap
+        now_below = closes[i] < p - min_gap
+        if was_below and now_above:
+            best = {"level": p, "direction": "bullish"}
+        elif was_above and now_below:
+            best = {"level": p, "direction": "bearish"}
+    return best
+
+
+# NEW v5.4: zone-overlap dedup against open (unresolved) signals
+def overlapping_open_signal(state, direction, entry_low, entry_high, min_overlap_pct=DEDUP_OVERLAP_PCT):
+    width = max(entry_high - entry_low, 1e-6)
+    for s in state.get("open_signals", []):
+        if s.get("direction") != direction:
+            continue
+        s_entry = s.get("entry")
+        if s_entry is None:
+            continue
+        # open_signals stores a single entry price, not a saved zone width;
+        # treat it as a point and check whether it falls inside the new zone
+        # (a cheap, conservative overlap check without changing state schema)
+        if entry_low <= s_entry <= entry_high:
+            return s
+        # also catch the case where the new zone is fully outside but very
+        # close (near-duplicate re-signal a few candles later)
+        dist = min(abs(entry_low - s_entry), abs(entry_high - s_entry))
+        if dist <= width * (1 - min_overlap_pct):
+            return s
+    return None
+
+
 def find_last_order_block(opens, highs, lows, closes, atr_vals, i, impulse_mult=1.5, lookback=40):
     start = max(1, i - lookback)
     for k in range(i, start, -1):
@@ -593,74 +822,98 @@ def compute_confluence(signal, bos_bull, bos_bear, nearest_fvg, order_block,
     if nearest_fvg and ((signal == 1 and nearest_fvg["type"] == "bullish") or
                         (signal == -1 and nearest_fvg["type"] == "bearish")):
         aligned += 1
-    if order_block and ((signal == 1 and order_block["type"] == "bullish") or
-                        (signal == -1 and order_block["type"] == "bearish")):
+    ob_aligned = order_block and ((signal == 1 and order_block["type"] == "bullish") or
+                                  (signal == -1 and order_block["type"] == "bearish"))
+    if ob_aligned:
         aligned += 1
+    # CHANGED v5.4: an order block of the OPPOSITE type sitting on the zone is
+    # now a penalty, not just a cosmetic label — it was previously ignored by
+    # the score entirely even when flagged "opposing" in the message.
+    elif order_block:
+        aligned -= OPPOSING_OB_PENALTY
     if (signal == 1 and swept_low) or (signal == -1 and swept_high):
         aligned += 1
     if htf_trend and ((signal == 1 and htf_trend == "up") or (signal == -1 and htf_trend == "down")):
         aligned += 1
+    aligned = max(aligned, 0)
     return aligned, total
 
 
 # ---------------------------------------------------------------------------
 # NEW v5.1 helpers
 # ---------------------------------------------------------------------------
-def detect_pullback_entry(opens, highs, lows, closes, ema_fast, ema_slow, atr_vals, i):
+def detect_pullback_entry(opens, highs, lows, closes, ema_fast, ema_slow, atr_vals, i, diag=None):
     """
-    NEW v5.2. Detect a DOWN-trend continuation (sell-side) pullback that just
-    resumed on candle i. For an up-trend the caller passes mirrored (negated)
-    data, so the same logic serves both directions.
+    Detect a DOWN-trend continuation (sell-side) pullback that just resumed on
+    candle i. For an up-trend the caller passes mirrored (negated) data, so the
+    same logic serves both directions.
 
-    Returns a dict (values in the passed-in price space) or None:
+    Returns a dict (values in the passed-in price space) or None. When it
+    returns None and `diag` is a list, ONE human-readable reason is appended
+    (v5.2.1 logging only; it never changes the result).
       leg_start  - high of the leg being retraced
       leg_end    - low of that leg (the extreme before the bounce)
       pb_extreme - high of the counter-trend bounce
       bounce, leg_height, retrace
+    Reasons starting with "trend:" mean no established trend on this side;
+    "n/a:" means there was not enough data to evaluate.
     """
+    def no(msg):
+        if diag is not None:
+            diag.append(msg)
+        return None
+
     atr_now = atr_vals[i]
     need = max(PULLBACK_TREND_MIN_CANDLES, PULLBACK_SLOPE_CANDLES + 1, 8)
     if atr_now is None or i < need:
-        return None
+        return no("n/a: not enough candles in this session yet")
 
     # 1) established trend, inside this session segment
     for k in range(i - PULLBACK_TREND_MIN_CANDLES + 1, i + 1):
         if ema_fast[k] is None or ema_slow[k] is None or not (ema_fast[k] < ema_slow[k]):
-            return None
+            return no(f"trend: EMA20 not on the trend side of EMA50 for the last {PULLBACK_TREND_MIN_CANDLES} candles")
     if ema_slow[i - PULLBACK_SLOPE_CANDLES] is None or not (ema_slow[i] < ema_slow[i - PULLBACK_SLOPE_CANDLES]):
-        return None
+        return no("trend: EMA50 is not sloping with the trend")
     if closes[i] >= ema_slow[i]:
-        return None
+        return no("trend: price is on the wrong side of EMA50")
 
     # 2) the leg extreme (lowest low before the current candle) and the bounce after it
     lo_start = max(0, i - PULLBACK_LOW_WINDOW)
     window = lows[lo_start:i]
     if len(window) < 4:
-        return None
+        return no("n/a: not enough candles to find the leg extreme")
     leg_end = min(window)
     j = lo_start + max(n for n, v in enumerate(window) if v == leg_end)  # latest occurrence
     if i - j < 3:  # need at least two bounce candles between the extreme and now
-        return None
+        return no(f"no bounce yet: the latest extreme was only {i - j} candle(s) ago (need 3+), price is still pushing the trend")
 
     pb_extreme = max(highs[j + 1:i])
     bounce = pb_extreme - leg_end
     if bounce < PULLBACK_MIN_BOUNCE_ATR * atr_now:
-        return None
+        return no(f"bounce too small: {bounce / atr_now:.1f} ATR (need {PULLBACK_MIN_BOUNCE_ATR})")
     if pb_extreme > ema_slow[i] + 0.5 * atr_now:  # bounce reclaimed the slow EMA = trend weakening
-        return None
+        return no("bounce reclaimed EMA50 - trend looks weakened, skipping")
 
     leg_start = max(highs[max(0, j - PULLBACK_LEG_LOOKBACK):j + 1])
     leg_height = leg_start - leg_end
     if leg_height < PULLBACK_MIN_LEG_ATR * atr_now:
-        return None
+        return no(f"leg too small: {leg_height / atr_now:.1f} ATR (need {PULLBACK_MIN_LEG_ATR})")
     retrace = bounce / leg_height
     if retrace > PULLBACK_MAX_RETRACE:
-        return None
+        return no(f"retrace too deep: {retrace * 100:.0f}% of the leg (max {PULLBACK_MAX_RETRACE * 100:.0f}%) - possible reversal")
 
     # 3) confirmation: trend-direction candle that closes beyond the prior candle's low
     body = opens[i] - closes[i]
-    if not (closes[i] < opens[i] and closes[i] < lows[i - 1] and body >= PULLBACK_MIN_BODY_ATR * atr_now):
-        return None
+    missing = []
+    if not closes[i] < opens[i]:
+        missing.append("last candle is not in the trend direction")
+    if not closes[i] < lows[i - 1]:
+        missing.append("it has not closed beyond the previous candle's extreme")
+    if closes[i] < opens[i] and body < PULLBACK_MIN_BODY_ATR * atr_now:
+        missing.append(f"body too small ({body / atr_now:.2f} ATR, need {PULLBACK_MIN_BODY_ATR})")
+    if missing:
+        return no(f"setup qualifies (bounce {bounce / atr_now:.1f} ATR, {retrace * 100:.0f}% of leg) but waiting for confirmation: "
+                  + "; ".join(missing))
 
     return {"leg_start": leg_start, "leg_end": leg_end, "pb_extreme": pb_extreme,
             "bounce": bounce, "leg_height": leg_height, "retrace": retrace}
@@ -837,8 +1090,11 @@ def run(state, now_utc):
             "event": "result", "time_utc": s["candle_time"], "direction": s["direction"],
             "trigger": s.get("trigger", ""), "entry": f"{s['entry']:.2f}", "sl": f"{s['sl']:.2f}",
             "tp1": f"{s['tp1']:.2f}", "tp2": f"{s['tp2']:.2f}", "confluence": s.get("confluence", ""),
+            "confidence_tier": s.get("confidence_tier", ""),
             "outcome": s["outcome"], "candles_to_resolve": s.get("candles_seen", ""),
         })
+        # CHANGED v5.5: every signal is sent now, so every result has a
+        # matching entry alert — no need to gate this by tier anymore.
         if SEND_OUTCOME_MESSAGES:
             send_telegram(
                 f"Result: {s['direction']} @ {s['entry']:.2f} ({s['candle_time']} UTC) -> {s['outcome']} "
@@ -902,8 +1158,13 @@ def run(state, now_utc):
     # NEW v5.2: trend-continuation pullback (checked before the momentum spike,
     # because it is a better-located entry than chasing a spike)
     pullback = None
+    pb_diag_msg = None  # v5.2.1: why the pullback trigger did not fire (logging only)
+    if signal == 0 and PULLBACK_ENABLED and seg_len < PULLBACK_MIN_SEGMENT_CANDLES:
+        pb_diag_msg = (f"not evaluated: only {seg_len} candles since session start/gap "
+                       f"(need {PULLBACK_MIN_SEGMENT_CANDLES})")
     if signal == 0 and PULLBACK_ENABLED and seg_len >= PULLBACK_MIN_SEGMENT_CANDLES:
-        info = detect_pullback_entry(s_o, s_h, s_l, s_c, s_ef, s_es, s_atr, s_i)
+        d_sell, d_buy = [], []
+        info = detect_pullback_entry(s_o, s_h, s_l, s_c, s_ef, s_es, s_atr, s_i, diag=d_sell)
         if info:
             signal = -1
             pullback = info
@@ -911,7 +1172,18 @@ def run(state, now_utc):
             neg = lambda arr: [(-x if x is not None else None) for x in arr]
             # mirrored data: buy-side pullback == sell-side pullback on negated prices
             m = detect_pullback_entry(neg(s_o), neg(s_l), neg(s_h), neg(s_c),
-                                      neg(s_ef), neg(s_es), s_atr, s_i)
+                                      neg(s_ef), neg(s_es), s_atr, s_i, diag=d_buy)
+            if signal == 0 and not m:
+                # report the side whose trend conditions held; otherwise say there is no trend
+                if d_sell and not d_sell[0].startswith(("trend:", "n/a:")):
+                    pb_diag_msg = "SELL side - " + d_sell[0]
+                elif d_buy and not d_buy[0].startswith(("trend:", "n/a:")):
+                    pb_diag_msg = "BUY side - " + d_buy[0]
+                elif d_sell and d_sell[0].startswith("n/a:"):
+                    pb_diag_msg = d_sell[0][5:]
+                else:
+                    pb_diag_msg = (f"no established {PULLBACK_TREND_MIN_CANDLES}-candle trend "
+                                   f"(EMA20/EMA50 not aligned and sloping) on either side")
             if m:
                 signal = 1
                 pullback = {"leg_start": -m["leg_start"], "leg_end": -m["leg_end"],
@@ -928,35 +1200,86 @@ def run(state, now_utc):
             signal, trigger_type = -1, "momentum spike"
 
     if signal == 0:
-        print(f"No signal at {times[i]}. Trend up={trend_up}, RSI={rsi_vals[i]:.1f}")
+        print(f"No signal at {times[i]}. Trend up={trend_up}, RSI={rsi_vals[i]:.1f}, ATR=${atr_now:.2f}")
+        if pb_diag_msg:
+            print(f"Pullback check: {pb_diag_msg}")
         return
 
     direction = "BUY" if signal == 1 else "SELL"
     flags = []
 
-    # NEW: overextension filter (chasing)
+    # NEW: overextension filter (chasing) — CHANGED v5.5: flags by default, no
+    # longer suppresses (see OVEREXTENSION_ACTION); boolean carried forward
+    # into the setup-strength score.
+    overextended_flag = False
     if OVEREXTENSION_ACTION != "off":
         ext = ((closes[i] - ema_fast[i]) if signal == 1 else (ema_fast[i] - closes[i])) / atr_now
         ext_limit = PULLBACK_OVEREXTENSION_ATR_MULT if trigger_type == "pullback" else OVEREXTENSION_ATR_MULT
         if ext > ext_limit:
+            overextended_flag = True
             if OVEREXTENSION_ACTION == "suppress":
                 print(f"{direction} suppressed: price is {ext:.1f} ATR from EMA{EMA_FAST} "
                       f"(limit {ext_limit}) — overextended, likely chasing.")
                 return
             flags.append(f"overextended: {ext:.1f} ATR from EMA{EMA_FAST}")
 
-    # NEW: cooldown / per-direction cap
-    blocked, reason = check_cooldown(state, direction, candle_dt)
-    if blocked:
-        print(f"{direction} suppressed — {reason}")
-        return
+    # NEW v5.4/CHANGED v5.5: sweep cooldown — a sweep+reject is itself a
+    # reversal signal; a continuation signal fighting it (sell right after a
+    # swept LOW got rejected upward, or buy right after a swept HIGH got
+    # rejected downward) is flagged (default) rather than blocked. The
+    # boolean feeds the setup-strength score computed later.
+    fights_sweep = False
+    if SWEEP_COOLDOWN_ENABLED and trigger_type in ("trend", "pullback"):
+        sweep_kind, sweep_idx, sweep_level = find_recent_sweep(s_h, s_l, s_c, s_i, SWEEP_COOLDOWN_CANDLES)
+        fights_sweep = (sweep_kind == "low" and signal == -1) or (sweep_kind == "high" and signal == 1)
+        if fights_sweep:
+            candles_ago = s_i - sweep_idx
+            msg = (f"{direction} vs recent liquidity sweep: {sweep_kind} swept at {sweep_level:.2f} "
+                  f"and rejected {candles_ago} candle(s) ago")
+            if SWEEP_COOLDOWN_ACTION == "suppress":
+                print(f"{direction} suppressed — {msg}.")
+                return
+            flags.append(msg)
 
-    # NEW: alert latency
+    # NEW v5.4: support/resistance levels — computed whenever enabled so the
+    # nearest level can be shown as context in the message later, not only
+    # used to gate continuation trades.
+    sr_levels = find_sr_levels(s_h, s_l, s_i, atr_now) if SR_ENABLED else []
+    sr_reclaim = detect_level_reclaim(sr_levels, s_c, s_i, atr_now) if sr_levels else None
+
+    # CHANGED v5.5: structure reclaim now flags by default instead of
+    # blocking. Only applies to trend/pullback (continuation) triggers.
+    fights_reclaim = False
+    if SR_ENABLED and trigger_type in ("trend", "pullback") and sr_reclaim:
+        fights_reclaim = (
+            (sr_reclaim["direction"] == "bullish" and signal == -1) or
+            (sr_reclaim["direction"] == "bearish" and signal == 1)
+        )
+        if fights_reclaim:
+            msg = (f"{direction} vs structure reclaim: price reclaimed {sr_reclaim['level']:.2f} "
+                  f"({sr_reclaim['direction']}) within the last {SR_RECLAIM_LOOKBACK_CANDLES} candles")
+            if SR_RECLAIM_ACTION == "suppress":
+                print(f"{direction} suppressed — {msg}.")
+                return
+            flags.append(msg)
+
+    # NEW: cooldown / per-direction cap — CHANGED v5.5: flags by default
+    blocked, reason = check_cooldown(state, direction, candle_dt)
+    cooldown_flag = blocked
+    if blocked:
+        if COOLDOWN_ACTION == "suppress":
+            print(f"{direction} suppressed — {reason}")
+            return
+        flags.append(reason)
+
+    # NEW: alert latency — CHANGED v5.5: flags by default instead of suppressing
     latency_min = (now_utc - (candle_dt + datetime.timedelta(minutes=INTERVAL_MINUTES))).total_seconds() / 60
     if latency_min > LATENCY_SUPPRESS_MIN:
-        print(f"{direction} suppressed: candle closed {latency_min:.0f} min ago (limit {LATENCY_SUPPRESS_MIN}).")
-        return
-    if latency_min > LATENCY_FLAG_MIN:
+        if LATENCY_ACTION == "suppress":
+            print(f"{direction} suppressed: candle closed {latency_min:.0f} min ago (limit {LATENCY_SUPPRESS_MIN}).")
+            return
+        flags.append(f"very late alert: candle closed {latency_min:.0f} min ago — entry zone may be stale")
+    elif latency_min > LATENCY_FLAG_MIN:
         flags.append(f"late alert: candle closed {latency_min:.0f} min ago")
 
     # NEW: post-reopen handling
@@ -972,15 +1295,41 @@ def run(state, now_utc):
         print("Recent clean range too tight — treating as unreliable data, skipping run.")
         return
 
+    # CHANGED v5.5: HTF conflict now flags by default instead of suppressing;
+    # boolean feeds the setup-strength score below.
     htf_trend = fetch_htf_trend()
-    if (REQUIRE_HTF_AGREEMENT_FOR_TREND_SIGNALS and trigger_type in ("trend", "pullback") and htf_trend is not None):
-        if (htf_trend == "up" and signal == -1) or (htf_trend == "down" and signal == 1):
-            print(f"Trend-trigger {direction} conflicts with 1H trend ({htf_trend}) — suppressed.")
-            return
+    htf_conflict = False
+    if trigger_type in ("trend", "pullback") and htf_trend is not None:
+        htf_conflict = (htf_trend == "up" and signal == -1) or (htf_trend == "down" and signal == 1)
+        if htf_conflict:
+            if HTF_CONFLICT_ACTION == "suppress":
+                print(f"Trend-trigger {direction} conflicts with 1H trend ({htf_trend}) — suppressed.")
+                return
+            flags.append(f"{direction} conflicts with 1H trend ({htf_trend})")
+
+    # NEW v5.4: 15m/1H divergence note (informational only, does not suppress)
+    # — flags when the working-timeframe EMA20 is sloping against the 1H
+    # trend, so a turning lower-timeframe trend isn't silently invisible.
+    ltf_divergence_note = None
+    if htf_trend is not None and i - LTF_SLOPE_CANDLES >= 0 and ema_fast[i - LTF_SLOPE_CANDLES] is not None:
+        ltf_slope_up = ema_fast[i] > ema_fast[i - LTF_SLOPE_CANDLES]
+        if (htf_trend == "down" and ltf_slope_up) or (htf_trend == "up" and not ltf_slope_up):
+            ltf_dir = "up" if ltf_slope_up else "down"
+            ltf_divergence_note = (f"15m EMA{EMA_FAST} sloping {ltf_dir} while 1H trend is {htf_trend} "
+                                   f"— lower timeframe may be turning")
 
     close_now = closes[i]
     half_width = atr_now * ENTRY_RANGE_ATR_MULT
     entry_low, entry_high = close_now - half_width, close_now + half_width
+
+    # NEW v5.4: zone-overlap dedup — suppress a near-repeat of an unresolved
+    # same-direction signal instead of resending essentially the same trade.
+    if DEDUP_ENABLED:
+        dup = overlapping_open_signal(state, direction, entry_low, entry_high)
+        if dup is not None:
+            print(f"{direction} suppressed: zone overlaps an unresolved {direction} signal "
+                  f"from {dup.get('candle_time', '?')} (entry {dup.get('entry')}).")
+            return
 
     sl_distance = max(atr_now * SL_ATR_MULT, MIN_SL_DOLLARS)
     tp1_distance = max(atr_now * TP_ATR_MULT, MIN_TP_DOLLARS)
@@ -1062,6 +1411,21 @@ def run(state, now_utc):
         print(f"Confluence {aligned}/{total} below MIN_CONFLUENCE_TO_SEND={MIN_CONFLUENCE_TO_SEND} — suppressing.")
         return
 
+    # NEW v5.5: setup-strength label — replaces the old send/no-send tier.
+    # Every signal is sent now; this just tells you how much to trust it.
+    # adjusted_score = confluence (0-5, already includes the opposing-OB
+    # penalty from v5.4) minus 1 point each for the "fighting the tape"
+    # conditions flagged above.
+    strength_penalty = sum([overextended_flag, fights_sweep, fights_reclaim, htf_conflict])
+    adjusted_score = max(aligned - strength_penalty, 0)
+    if adjusted_score >= STRENGTH_STRONG_MIN:
+        setup_strength = "STRONG"
+    elif adjusted_score >= STRENGTH_MEDIUM_MIN:
+        setup_strength = "MEDIUM"
+    else:
+        setup_strength = "WEAK"
+    confidence_tier = setup_strength  # kept for CSV/state field-name continuity
+
     # ---- NEW: targets ----
     if signal == 1:
         sl = close_now - sl_distance
@@ -1082,7 +1446,10 @@ def run(state, now_utc):
             counter_trend_note = " (counter-trend spike)"
 
     trigger_label = "trend-continuation pullback" if pullback else trigger_type
+    strength_emoji = {"STRONG": "🟢", "MEDIUM": "🟡", "WEAK": "🔴"}[setup_strength]
     message = (
+        f"{strength_emoji} Setup strength: {setup_strength}  (confluence {aligned}/{total}, "
+        f"adjusted {adjusted_score} after {strength_penalty} caution flag(s))\n\n"
         f"XAU/USD {direction} zone{counter_trend_note}\n"
         f"Trigger: {trigger_label}\n"
         f"Zone: {entry_low:.2f} - {entry_high:.2f}\n"
@@ -1117,6 +1484,8 @@ def run(state, now_utc):
         agreement = ("agrees with" if (htf_trend == "up" and signal == 1) or (htf_trend == "down" and signal == -1)
                      else "conflicts with")
         message += f"1H trend: {htf_trend} ({agreement} this signal)\n"
+    if ltf_divergence_note:
+        message += f"⚠️ Divergence: {ltf_divergence_note}\n"
     killzone = get_killzone(times[i])
     message += f"Session: {killzone}\n" if killzone else "Session: outside main London/New York killzones\n"
     if eq_high is not None:
@@ -1125,6 +1494,14 @@ def run(state, now_utc):
         message += f"Equal lows (liquidity pool) near {eq_low:.2f}\n"
     if ote:
         message += f"OTE zone {ote['type']}: {ote['low']:.2f} - {ote['high']:.2f}\n"
+    # NEW v5.4: nearest S/R level, shown as context
+    nearest_lvl = nearest_sr_level(sr_levels, close_now, MAX_CONTEXT_DISTANCE_ATR, atr_now)
+    if nearest_lvl:
+        role = "resistance" if nearest_lvl["price"] > close_now else "support"
+        message += f"Nearby S/R level ({role}, {nearest_lvl['touches']} touches): {nearest_lvl['price']:.2f}\n"
+    if sr_reclaim:
+        message += (f"Structure reclaim: price reclaimed {sr_reclaim['level']:.2f} "
+                    f"({sr_reclaim['direction']}) recently\n")
     if news_flag:
         message += f"\n⚠️ CAUTION: high-impact USD news nearby ({news_title})\n"
     message += "\nData status: live (session, freshness, ATR, range and clean-candle checks passed)\n"
@@ -1134,6 +1511,9 @@ def run(state, now_utc):
     )
 
     print(message)
+    # CHANGED v5.5: every signal is sent now — nothing is withheld based on
+    # setup strength. The WEAK/MEDIUM/STRONG label above is for your own
+    # manual filtering, not the bot's.
     send_telegram(message)
 
     # ---- state, cooldown history, tracker, log ----
@@ -1143,14 +1523,14 @@ def run(state, now_utc):
     state.setdefault("open_signals", []).append({
         "candle_time": candle_time, "direction": direction, "trigger": trigger_type,
         "entry": close_now, "sl": sl, "tp1": tp1, "tp2": tp2,
-        "confluence": f"{aligned}/{total}", "stage": 0, "candles_seen": 0,
-        "last_checked": candle_time,
+        "confluence": f"{aligned}/{total}", "confidence_tier": confidence_tier,
+        "stage": 0, "candles_seen": 0, "last_checked": candle_time,
     })
     append_log({
         "event": "signal", "time_utc": candle_time, "direction": direction, "trigger": trigger_type,
         "entry": f"{close_now:.2f}", "sl": f"{sl:.2f}", "tp1": f"{tp1:.2f}", "tp2": f"{tp2:.2f}",
-        "confluence": f"{aligned}/{total}", "latency_min": f"{max(latency_min, 0):.0f}",
-        "flags": " | ".join(flags),
+        "confluence": f"{aligned}/{total}", "confidence_tier": confidence_tier,
+        "latency_min": f"{max(latency_min, 0):.0f}", "flags": " | ".join(flags),
     })
 
 
