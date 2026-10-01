@@ -1,5 +1,40 @@
 """
-Gold (XAU/USD) signal guide bot — v5.5
+Gold (XAU/USD) signal guide bot — v5.6
+
+NEW in v5.6 (built on v5.5's "send everything, label it" approach): fixes for
+five specific flaws found by comparing live v5.5 signals against the actual
+charts over a full session:
+
+  1. Sweep-staleness check: a BUY (or SELL) was getting penalized as "fighting
+     a recent sweep" even after price had already moved well past the swept
+     level in the signal's own direction — i.e. the market had already
+     overridden the sweep's implied reversal, but the bot kept penalizing it.
+     Now: if price has moved more than STALE_OVERRIDE_ATR_MULT ATRs past the
+     swept level in the signal's favor, it's flagged as context but NOT
+     penalized in the strength score.
+  2. HTF-conflict weighting: a full "conflicts with 1H trend" penalty was
+     applied even when the bot's own 15m/1H divergence note showed the 15m
+     already turning the signal's way — i.e. the 1H read was likely lagging,
+     not necessarily wrong. That case now gets a HALF penalty (0.5 instead of
+     1.0), still flagged, not silently ignored.
+  3. Spike-candle overextension: momentum-spike triggers were exempt from the
+     EMA-distance overextension check by design (that's the point of a spike
+     trigger) but had NO extension check at all — which is how a BUY fired
+     near the top of a 28-pt vertical run with zero caution attached. New
+     check measures the triggering candle's own range in ATRs
+     (SPIKE_EXT_ATR_MULT) and flags/penalizes large ones.
+  4. Cooldown/cap now carries real weight: in live data, the one signal that
+     also carried a "cap: N signals already sent" flag was also the session's
+     clear loser — a late, chase-y repeat entry. It now costs 0.5 strength
+     points instead of being purely cosmetic.
+  5. Real pre/post news windows: the single symmetric NEWS_BUFFER_MIN flag
+     is now two separate windows (NEWS_BUFFER_MIN before, NEWS_POST_BUFFER_MIN
+     after a confirmed high-impact USD release, via a live economic-calendar
+     feed) and actually costs NEWS_PENALTY strength points, not just a
+     cosmetic caution line — this is what should have downgraded the BUY that
+     fired right before Core PCE and got stopped out by the whipsaw.
+
+--- v5.5 notes (unchanged) ---
 
 NEW in v5.5 (built on v5.4, no removals): "don't miss opportunities" mode.
 Every signal that clears basic data-quality checks is now sent — nothing is
@@ -154,7 +189,14 @@ TP_ATR_MULT = 2.5
 MOMENTUM_SPIKE_ATR_MULT = 2.0
 HTF_INTERVAL = "1h"
 
-NEWS_BUFFER_MIN = 30
+NEWS_BUFFER_MIN = 30             # CHANGED v5.6: now the PRE-release window only
+NEWS_POST_BUFFER_MIN = 20        # NEW v5.6: separate, shorter POST-release window — the PCE
+                                  # trade showed violent whipsaws continuing for a while AFTER
+                                  # the print, not just before it
+NEWS_PENALTY = 1.0               # NEW v5.6: a signal inside either window now costs a real
+                                  # strength point, not just a cosmetic caution line — a
+                                  # technically sound MEDIUM setup should drop toward WEAK if
+                                  # it's about to walk into a high-impact release
 NEWS_FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # ---- v5 data-integrity config ----
@@ -184,6 +226,13 @@ SEGMENT_SHORT_ACTION = "flag"   # "flag" | "suppress" when segment is shorter th
 # ---- NEW v5.1: signal-quality config ----
 OVEREXTENSION_ATR_MULT = 3.5    # distance of close from EMA_FAST, in ATRs, in the signal direction
 OVEREXTENSION_ACTION = "flag"   # CHANGED v5.5 (was "suppress"): "flag" | "suppress" | "off"
+SPIKE_EXT_ATR_MULT = 2.5        # NEW v5.6: momentum-spike triggers get their OWN extension check.
+                                 # A spike is exempt from the normal trend/pullback EMA-distance
+                                 # threshold (it's supposed to catch fast moves) — but that let a
+                                 # signal fire near the TOP of a 28-pt vertical run with no check
+                                 # at all. This measures the triggering candle's own range in ATRs:
+                                 # if it's already this large, the move is likely near exhaustion.
+SPIKE_EXT_ACTION = "flag"       # "flag" | "suppress"
 
 COOLDOWN_CANDLES = 4            # same-direction signals closer than this many candles are flagged
 WINDOW_CANDLES = 16             # rolling window for the per-direction cap
@@ -232,6 +281,11 @@ PULLBACK_OVEREXTENSION_ATR_MULT = 6.0  # looser overextension limit for pullback
 SWEEP_COOLDOWN_ENABLED = True
 SWEEP_COOLDOWN_CANDLES = 6          # how far back to look for a sweep+reject
 SWEEP_COOLDOWN_ACTION = "flag"      # CHANGED v5.5 (was "suppress"): "flag" | "suppress"
+STALE_OVERRIDE_ATR_MULT = 1.0       # NEW v5.6: if price has already moved this many ATRs past
+                                     # the swept level IN THE SIGNAL'S OWN DIRECTION, the sweep's
+                                     # implied reversal has already been overridden by the market —
+                                     # don't penalize a signal for "fighting" a sweep it's actually
+                                     # riding the aftermath of.
 
 # ---- NEW v5.4: support/resistance levels + structure reclaim ----
 SR_ENABLED = True
@@ -792,13 +846,25 @@ def fetch_htf_trend():
     return "up" if htf_fast[j] > htf_slow[j] else "down"
 
 
-def is_news_window(buffer_minutes):
+def is_news_window(pre_buffer_minutes, post_buffer_minutes):
+    """
+    CHANGED v5.6: separate pre/post windows instead of one symmetric buffer.
+    Returns (in_window, title, phase) where phase is "pre" or "post" — a
+    signal walking INTO a release (pre) and one issued shortly AFTER a print
+    already happened (post, still volatile) are both real risks, but a
+    "post" signal that also matches a genuine trend shift (confirmed by BOS/
+    reclaim elsewhere in the message) is informational context, not
+    necessarily wrong — the caller still applies the strength penalty either
+    way, but the phase is shown so you can read a post-news trend signal
+    (like today's SELL that rode the PCE reversal) differently from a
+    pre-news chase.
+    """
     try:
         resp = requests.get(NEWS_FEED_URL, timeout=15)
         events = resp.json()
     except Exception as e:
         print(f"News feed unavailable, skipping news filter this run: {e}")
-        return False, ""
+        return False, "", None
 
     now = datetime.datetime.now(datetime.timezone.utc)
     for ev in events:
@@ -806,11 +872,14 @@ def is_news_window(buffer_minutes):
             if ev.get("country") != "USD" or ev.get("impact") != "High":
                 continue
             ev_time = datetime.datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
-            if abs((ev_time - now).total_seconds()) / 60 <= buffer_minutes:
-                return True, ev.get("title", "high-impact USD event")
+            delta_min = (now - ev_time).total_seconds() / 60
+            if -pre_buffer_minutes <= delta_min <= 0:
+                return True, ev.get("title", "high-impact USD event"), "pre"
+            if 0 < delta_min <= post_buffer_minutes:
+                return True, ev.get("title", "high-impact USD event"), "post"
         except Exception:
             continue
-    return False, ""
+    return False, "", None
 
 
 def compute_confluence(signal, bos_bull, bos_bear, nearest_fvg, order_block,
@@ -1223,23 +1292,48 @@ def run(state, now_utc):
                 return
             flags.append(f"overextended: {ext:.1f} ATR from EMA{EMA_FAST}")
 
-    # NEW v5.4/CHANGED v5.5: sweep cooldown — a sweep+reject is itself a
-    # reversal signal; a continuation signal fighting it (sell right after a
-    # swept LOW got rejected upward, or buy right after a swept HIGH got
-    # rejected downward) is flagged (default) rather than blocked. The
-    # boolean feeds the setup-strength score computed later.
+    # NEW v5.6: momentum-spike triggers skip the EMA-distance overextension
+    # check above by design (that's the whole point of a spike trigger), but
+    # that left them with NO extension check at all — which is how a signal
+    # fired near the top of a 28-pt vertical run with no caution attached.
+    # This checks the SPIKE CANDLE'S OWN RANGE instead of distance from EMA.
+    spike_overextended_flag = False
+    if trigger_type == "spike":
+        spike_range_atr = (highs[i] - lows[i]) / atr_now if atr_now else 0
+        if spike_range_atr > SPIKE_EXT_ATR_MULT:
+            spike_overextended_flag = True
+            msg = (f"spike candle range is {spike_range_atr:.1f} ATR — an already large, fast move; "
+                  f"risk of entering near exhaustion rather than the start of it")
+            if SPIKE_EXT_ACTION == "suppress":
+                print(f"{direction} suppressed: {msg}.")
+                return
+            flags.append(msg)
+
+    # NEW v5.4/CHANGED v5.5/v5.6: sweep cooldown — a sweep+reject is itself a
+    # reversal signal; a continuation signal fighting it is flagged rather
+    # than blocked. NEW v5.6: if price has already moved well past the swept
+    # level in THIS signal's own direction, the sweep's implied reversal has
+    # already been overridden — don't penalize riding a move that followed
+    # the sweep, which earlier mislabeled at least one good BUY as WEAK.
     fights_sweep = False
     if SWEEP_COOLDOWN_ENABLED and trigger_type in ("trend", "pullback"):
         sweep_kind, sweep_idx, sweep_level = find_recent_sweep(s_h, s_l, s_c, s_i, SWEEP_COOLDOWN_CANDLES)
-        fights_sweep = (sweep_kind == "low" and signal == -1) or (sweep_kind == "high" and signal == 1)
-        if fights_sweep:
+        raw_conflict = (sweep_kind == "low" and signal == -1) or (sweep_kind == "high" and signal == 1)
+        if raw_conflict:
+            moved_since = (s_c[s_i] - sweep_level) if signal == 1 else (sweep_level - s_c[s_i])
             candles_ago = s_i - sweep_idx
-            msg = (f"{direction} vs recent liquidity sweep: {sweep_kind} swept at {sweep_level:.2f} "
-                  f"and rejected {candles_ago} candle(s) ago")
-            if SWEEP_COOLDOWN_ACTION == "suppress":
-                print(f"{direction} suppressed — {msg}.")
-                return
-            flags.append(msg)
+            if moved_since > STALE_OVERRIDE_ATR_MULT * atr_now:
+                flags.append(f"{direction} follows a {sweep_kind} sweep at {sweep_level:.2f} "
+                            f"({candles_ago} candle(s) ago) — price has since moved {moved_since:.1f} "
+                            f"pts past it this way, so not penalized as fighting it")
+            else:
+                fights_sweep = True
+                msg = (f"{direction} vs recent liquidity sweep: {sweep_kind} swept at {sweep_level:.2f} "
+                      f"and rejected {candles_ago} candle(s) ago")
+                if SWEEP_COOLDOWN_ACTION == "suppress":
+                    print(f"{direction} suppressed — {msg}.")
+                    return
+                flags.append(msg)
 
     # NEW v5.4: support/resistance levels — computed whenever enabled so the
     # nearest level can be shown as context in the message later, not only
@@ -1295,21 +1389,13 @@ def run(state, now_utc):
         print("Recent clean range too tight — treating as unreliable data, skipping run.")
         return
 
-    # CHANGED v5.5: HTF conflict now flags by default instead of suppressing;
-    # boolean feeds the setup-strength score below.
+    # CHANGED v5.5/v5.6: HTF conflict now flags by default instead of
+    # suppressing. NEW v5.6: compute the 15m/1H divergence note FIRST so we
+    # can tell a genuine trend conflict from a likely-lagging 1H read — the
+    # BUY-at-4175 case showed a full HTF-conflict penalty applied even though
+    # the 15m EMA had already turned the signal's way, which the divergence
+    # note itself was flagging.
     htf_trend = fetch_htf_trend()
-    htf_conflict = False
-    if trigger_type in ("trend", "pullback") and htf_trend is not None:
-        htf_conflict = (htf_trend == "up" and signal == -1) or (htf_trend == "down" and signal == 1)
-        if htf_conflict:
-            if HTF_CONFLICT_ACTION == "suppress":
-                print(f"Trend-trigger {direction} conflicts with 1H trend ({htf_trend}) — suppressed.")
-                return
-            flags.append(f"{direction} conflicts with 1H trend ({htf_trend})")
-
-    # NEW v5.4: 15m/1H divergence note (informational only, does not suppress)
-    # — flags when the working-timeframe EMA20 is sloping against the 1H
-    # trend, so a turning lower-timeframe trend isn't silently invisible.
     ltf_divergence_note = None
     if htf_trend is not None and i - LTF_SLOPE_CANDLES >= 0 and ema_fast[i - LTF_SLOPE_CANDLES] is not None:
         ltf_slope_up = ema_fast[i] > ema_fast[i - LTF_SLOPE_CANDLES]
@@ -1317,6 +1403,28 @@ def run(state, now_utc):
             ltf_dir = "up" if ltf_slope_up else "down"
             ltf_divergence_note = (f"15m EMA{EMA_FAST} sloping {ltf_dir} while 1H trend is {htf_trend} "
                                    f"— lower timeframe may be turning")
+
+    htf_conflict = False
+    htf_conflict_weight = 0
+    if trigger_type in ("trend", "pullback") and htf_trend is not None:
+        htf_conflict = (htf_trend == "up" and signal == -1) or (htf_trend == "down" and signal == 1)
+        if htf_conflict:
+            # NEW v5.6: if the 15m is already sloping the SAME way as this
+            # signal, the 1H reading is likely lagging a fresh reversal
+            # rather than a reliable trend call — half-penalty instead of a
+            # full one, flagged accordingly rather than silently reduced.
+            ltf_agrees_with_signal = ltf_divergence_note is not None and (
+                (signal == 1 and "sloping up" in ltf_divergence_note) or
+                (signal == -1 and "sloping down" in ltf_divergence_note)
+            )
+            htf_conflict_weight = 0.5 if ltf_agrees_with_signal else 1.0
+            if HTF_CONFLICT_ACTION == "suppress":
+                print(f"Trend-trigger {direction} conflicts with 1H trend ({htf_trend}) — suppressed.")
+                return
+            note = f"{direction} conflicts with 1H trend ({htf_trend})"
+            if ltf_agrees_with_signal:
+                note += " — but 15m is already turning this way; treated as a likely-lagging 1H read"
+            flags.append(note)
 
     close_now = closes[i]
     half_width = atr_now * ENTRY_RANGE_ATR_MULT
@@ -1348,7 +1456,7 @@ def run(state, now_utc):
         print(f"Already alerted this candle ({candle_time}, {direction}) — skipping duplicate.")
         return
 
-    news_flag, news_title = is_news_window(NEWS_BUFFER_MIN)
+    news_flag, news_title, news_phase = is_news_window(NEWS_BUFFER_MIN, NEWS_POST_BUFFER_MIN)
 
     # ---- NEW: SMC context computed on the current session segment only ----
 
@@ -1411,12 +1519,27 @@ def run(state, now_utc):
         print(f"Confluence {aligned}/{total} below MIN_CONFLUENCE_TO_SEND={MIN_CONFLUENCE_TO_SEND} — suppressing.")
         return
 
-    # NEW v5.5: setup-strength label — replaces the old send/no-send tier.
-    # Every signal is sent now; this just tells you how much to trust it.
-    # adjusted_score = confluence (0-5, already includes the opposing-OB
-    # penalty from v5.4) minus 1 point each for the "fighting the tape"
-    # conditions flagged above.
-    strength_penalty = sum([overextended_flag, fights_sweep, fights_reclaim, htf_conflict])
+    # NEW v5.5/CHANGED v5.6: setup-strength label — replaces the old
+    # send/no-send tier. Every signal is sent now; this tells you how much to
+    # trust it. adjusted_score = confluence (0-5, already includes the
+    # opposing-OB penalty from v5.4) minus weighted penalties:
+    #   - overextended (EMA-distance, trend/pullback triggers): 1.0
+    #   - spike-candle overextension (spike triggers only, NEW v5.6): 1.0
+    #   - fighting a recent sweep (NOT stale, NEW v5.6 staleness check): 1.0
+    #   - fighting a recent structure reclaim: 1.0
+    #   - HTF conflict: 1.0 normally, 0.5 if the 15m is already turning the
+    #     signal's way (NEW v5.6 — the 1H read is likely lagging, not wrong)
+    #   - cooldown/cap flag (NEW v5.6): 0.5 — today's data showed a capped,
+    #     late-in-window signal was also the one clear loss in its batch
+    strength_penalty = (
+        (1.0 if overextended_flag else 0)
+        + (1.0 if spike_overextended_flag else 0)
+        + (1.0 if fights_sweep else 0)
+        + (1.0 if fights_reclaim else 0)
+        + htf_conflict_weight
+        + (0.5 if cooldown_flag else 0)
+        + (NEWS_PENALTY if news_flag else 0)  # NEW v5.6: real penalty, not just cosmetic
+    )
     adjusted_score = max(aligned - strength_penalty, 0)
     if adjusted_score >= STRENGTH_STRONG_MIN:
         setup_strength = "STRONG"
@@ -1449,7 +1572,7 @@ def run(state, now_utc):
     strength_emoji = {"STRONG": "🟢", "MEDIUM": "🟡", "WEAK": "🔴"}[setup_strength]
     message = (
         f"{strength_emoji} Setup strength: {setup_strength}  (confluence {aligned}/{total}, "
-        f"adjusted {adjusted_score} after {strength_penalty} caution flag(s))\n\n"
+        f"adjusted {adjusted_score:g} after {strength_penalty:g} caution-flag weight)\n\n"
         f"XAU/USD {direction} zone{counter_trend_note}\n"
         f"Trigger: {trigger_label}\n"
         f"Zone: {entry_low:.2f} - {entry_high:.2f}\n"
@@ -1503,7 +1626,10 @@ def run(state, now_utc):
         message += (f"Structure reclaim: price reclaimed {sr_reclaim['level']:.2f} "
                     f"({sr_reclaim['direction']}) recently\n")
     if news_flag:
-        message += f"\n⚠️ CAUTION: high-impact USD news nearby ({news_title})\n"
+        phase_note = ("releasing within the next "
+                      f"{NEWS_BUFFER_MIN} min" if news_phase == "pre" else
+                      f"released within the last {NEWS_POST_BUFFER_MIN} min — volatility may still be elevated")
+        message += f"\n⚠️ CAUTION: high-impact USD news — {news_title} ({phase_note})\n"
     message += "\nData status: live (session, freshness, ATR, range and clean-candle checks passed)\n"
     message += (
         "\n(Guidance only — structure/FVG/order blocks/sweeps are added context, "
