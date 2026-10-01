@@ -1,5 +1,27 @@
 """
-Gold (XAU/USD) signal guide bot — v5.6
+Gold (XAU/USD) signal guide bot — v5.7
+
+NEW in v5.7 (built on v5.6):
+
+  1. Fibonacci retracement/extension: a proper fib module built off the same
+     swing-high/swing-low detection already used for structure/BOS (not the
+     old pullback-only OTE calculation, which is kept as-is alongside this).
+     Every message now shows the active leg's 23.6/38.2/50/61.8/78.6%
+     retracement levels when a direction-matched leg exists, and if price is
+     sitting in the 61.8-65% "golden pocket" in the signal's favor, that adds
+     one point to confluence (denominator is now 6, not 5 — see the
+     STRENGTH_STRONG_MIN/MEDIUM_MIN comment for how this interacts with the
+     strength tiers).
+  2. News-feed resilience: NEWS_FEED_URLS now holds two endpoints (with
+     retries per endpoint) instead of one single URL with no fallback. Worth
+     being honest about what this is: both endpoints serve the same
+     underlying Fair Economy / ForexFactory data — there is no genuinely
+     independent, free, no-auth forex calendar API to add as a true second
+     source (every "alternative" found is a paid scraper wrapping the same
+     feed). This is retry/mirror resilience against one endpoint being
+     temporarily down, not source diversification.
+
+--- v5.6 notes (unchanged) ---
 
 NEW in v5.6 (built on v5.5's "send everything, label it" approach): fixes for
 five specific flaws found by comparing live v5.5 signals against the actual
@@ -157,6 +179,7 @@ Guidance only. Places NO trades. Run on a schedule (e.g. GitHub Actions every
 """
 
 import os
+import time  # NEW v5.7: used for news-feed mirror retry backoff
 import sys
 import csv
 import json
@@ -198,6 +221,19 @@ NEWS_PENALTY = 1.0               # NEW v5.6: a signal inside either window now c
                                   # technically sound MEDIUM setup should drop toward WEAK if
                                   # it's about to walk into a high-impact release
 NEWS_FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+# NEW v5.7: a second URL for resilience. Worth being honest about what this
+# is NOT — there is no genuinely independent, free, no-auth forex economic
+# calendar API to use as a true second source; every free alternative found
+# is either this same Fair Economy / ForexFactory data re-served, or a paid
+# scraper wrapping it. NEWS_FEED_URLS below is retry resilience (a second
+# endpoint serving the same underlying feed, so one mirror being down
+# doesn't silently disable the news check) — not source diversity.
+NEWS_FEED_URLS = [
+    NEWS_FEED_URL,
+    "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+]
+NEWS_FEED_RETRIES = 2           # attempts per URL before moving to the next
+NEWS_FEED_RETRY_DELAY_SEC = 2
 
 # ---- v5 data-integrity config ----
 MIN_ATR_DOLLARS = 1.0
@@ -316,9 +352,15 @@ DEDUP_OVERLAP_PCT = 0.5             # >= this fraction of zone overlap with an o
 # adjusted_score = confluence aligned (0-5, already includes the opposing-OB
 # penalty) minus 1 point each for: fighting a recent sweep, fighting a recent
 # reclaim, overextension, HTF conflict (trend/pullback triggers only).
-STRENGTH_STRONG_MIN = 4    # adjusted_score >= this -> STRONG
+STRENGTH_STRONG_MIN = 4    # adjusted_score >= this -> STRONG (scale is now /6, see v5.7 note)
 STRENGTH_MEDIUM_MIN = 2    # adjusted_score >= this (and < STRONG_MIN) -> MEDIUM
                             # below STRENGTH_MEDIUM_MIN -> WEAK
+                            # CHANGED v5.7: confluence denominator is now 6, not 5 — a direction-
+                            # matched Fibonacci golden-pocket (61.8-65%) retracement is a standing
+                            # possible 6th point. Thresholds left unchanged (4/2); the fib bonus
+                            # only applies on the subset of signals that land in that zone, so most
+                            # scores are unaffected — it just means a signal WITH that confluence
+                            # needs one fewer of the other factors to reach the same tier.
 
 # ---- NEW v5.4: lower-timeframe / HTF divergence note ----
 LTF_SLOPE_CANDLES = 5               # candles used to judge the 15m EMA20 slope
@@ -570,6 +612,54 @@ def find_last_swing_low(lows, up_to_index, lookback=5):
         if window and lows[k] == min(window):
             return k, lows[k]
     return None, None
+
+
+# NEW v5.7: proper Fibonacci retracement/extension, built off the same swing
+# detection already used for structure/BOS — not the narrow, pullback-only
+# OTE calculation that existed before.
+FIB_RATIOS = [0.236, 0.382, 0.5, 0.618, 0.786]
+FIB_EXT_RATIOS = [1.272, 1.618]
+FIB_GOLDEN_LOW, FIB_GOLDEN_HIGH = 0.618, 0.65   # "golden pocket"
+FIB_PROXIMITY_ATR = 0.4                          # how close counts as "at" a level
+
+
+def compute_fib_levels(highs, lows, i, swing_lookback=5):
+    """
+    Finds the most recent swing high and swing low and treats whichever came
+    LATER as the end of the active leg (so direction is inferred from order,
+    not assumed). Returns retracement levels (23.6-78.6%) measured back from
+    that leg, plus 127.2%/161.8% extensions beyond it, or None if no clean
+    swing pair is found yet.
+    """
+    sh_idx, sh_val = find_last_swing_high(highs, i, swing_lookback)
+    sl_idx, sl_val = find_last_swing_low(lows, i, swing_lookback)
+    if sh_val is None or sl_val is None or sh_val <= sl_val:
+        return None
+    leg_range = sh_val - sl_val
+    direction = "bullish" if sh_idx > sl_idx else "bearish"  # leg ended on a high = bullish leg
+    levels = {}
+    if direction == "bullish":
+        for r in FIB_RATIOS:
+            levels[r] = sh_val - leg_range * r
+        for r in FIB_EXT_RATIOS:
+            levels[r] = sh_val + leg_range * (r - 1)
+    else:
+        for r in FIB_RATIOS:
+            levels[r] = sl_val + leg_range * r
+        for r in FIB_EXT_RATIOS:
+            levels[r] = sl_val - leg_range * (r - 1)
+    return {"direction": direction, "leg_low": sl_val, "leg_high": sh_val,
+           "leg_range": leg_range, "levels": levels}
+
+
+def nearest_fib_level(fib, price, atr_now):
+    """Returns (ratio, level_price) for the closest fib level to price, or None if too far."""
+    if not fib:
+        return None
+    ratio, level = min(fib["levels"].items(), key=lambda kv: abs(kv[1] - price))
+    if abs(level - price) > FIB_PROXIMITY_ATR * atr_now:
+        return None
+    return ratio, level
 
 
 # NEW: all fractal swing levels (used for structure-based targets)
@@ -860,10 +950,9 @@ def is_news_window(pre_buffer_minutes, post_buffer_minutes):
     pre-news chase.
     """
     try:
-        resp = requests.get(NEWS_FEED_URL, timeout=15)
-        events = resp.json()
+        events = _fetch_news_events()
     except Exception as e:
-        print(f"News feed unavailable, skipping news filter this run: {e}")
+        print(f"News feed unavailable from all mirrors, skipping news filter this run: {e}")
         return False, "", None
 
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -880,6 +969,27 @@ def is_news_window(pre_buffer_minutes, post_buffer_minutes):
         except Exception:
             continue
     return False, "", None
+
+
+def _fetch_news_events():
+    """
+    NEW v5.7: tries each URL in NEWS_FEED_URLS, with NEWS_FEED_RETRIES
+    attempts per URL before moving on, instead of giving up on the first
+    failed request to the single old endpoint. Raises the last error only
+    if every URL/attempt fails.
+    """
+    last_err = None
+    for url in NEWS_FEED_URLS:
+        for attempt in range(NEWS_FEED_RETRIES):
+            try:
+                resp = requests.get(url, timeout=15)
+                return resp.json()
+            except Exception as e:
+                last_err = e
+                if attempt < NEWS_FEED_RETRIES - 1:
+                    time.sleep(NEWS_FEED_RETRY_DELAY_SEC)
+        print(f"News feed mirror failed ({url}), trying next if available.")
+    raise last_err
 
 
 def compute_confluence(signal, bos_bull, bos_bear, nearest_fvg, order_block,
@@ -1496,7 +1606,7 @@ def run(state, now_utc):
         flags.append(f"limited SMC context: {seg_len} candles since session start/gap "
                      f"(premium/discount, OTE, equal-level tags omitted)")
 
-    eq_high = eq_low = ote = None
+    eq_high = eq_low = ote = fib = fib_near = None
     if smc_range_ok:
         eq_high = find_equal_levels(s_h, s_i, mode="high")
         eq_low = find_equal_levels(s_l, s_i, mode="low")
@@ -1510,11 +1620,27 @@ def run(state, now_utc):
             ote_is_bull = ote["type"].startswith("bullish")
             if ote_is_bull != (signal == 1) or not relevant_zone(ote):
                 ote = None
+        # NEW v5.7: Fibonacci retracement off the same swing structure used
+        # for BOS/order-block detection — informational like OTE, plus a
+        # small confluence bonus specifically for the golden pocket
+        # (61.8-65%) when it matches the signal's own direction.
+        fib = compute_fib_levels(s_h, s_l, s_i)
+        if fib is not None:
+            fib_is_bull = fib["direction"] == "bullish"
+            if fib_is_bull == (signal == 1):  # fib leg direction agrees with trade direction
+                fib_near = nearest_fib_level(fib, close_now, atr_now)
+            else:
+                fib = None  # leg direction disagrees with the signal; not relevant context
+
+    fib_golden_pocket = (fib_near is not None and FIB_GOLDEN_LOW <= fib_near[0] <= FIB_GOLDEN_HIGH)
 
     # confluence uses only the filtered (relevant) items
     aligned, total = compute_confluence(
         signal, bos_bull, bos_bear, nearest_fvg, order_block, swept_high, swept_low, htf_trend
     )
+    total += 1  # NEW v5.7: denominator now 6 — fib golden pocket is a standing possible point
+    if fib_golden_pocket:
+        aligned += 1  # golden-pocket (61.8-65%) retracement bonus, direction-matched
     if aligned < MIN_CONFLUENCE_TO_SEND:
         print(f"Confluence {aligned}/{total} below MIN_CONFLUENCE_TO_SEND={MIN_CONFLUENCE_TO_SEND} — suppressing.")
         return
@@ -1617,6 +1743,13 @@ def run(state, now_utc):
         message += f"Equal lows (liquidity pool) near {eq_low:.2f}\n"
     if ote:
         message += f"OTE zone {ote['type']}: {ote['low']:.2f} - {ote['high']:.2f}\n"
+    if fib:
+        pct_str = ", ".join(f"{int(r*1000)/10:g}%: {lvl:.2f}" for r, lvl in sorted(fib["levels"].items()) if r < 1)
+        message += (f"Fibonacci ({fib['direction']} leg {fib['leg_low']:.2f}-{fib['leg_high']:.2f}): "
+                    f"{pct_str}\n")
+        if fib_near:
+            pocket_note = " — GOLDEN POCKET" if fib_golden_pocket else ""
+            message += f"Price near {fib_near[0]*100:g}% fib level ({fib_near[1]:.2f}){pocket_note}\n"
     # NEW v5.4: nearest S/R level, shown as context
     nearest_lvl = nearest_sr_level(sr_levels, close_now, MAX_CONTEXT_DISTANCE_ATR, atr_now)
     if nearest_lvl:
