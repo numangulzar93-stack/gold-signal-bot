@@ -1,5 +1,120 @@
 """
-Gold (XAU/USD) signal guide bot — v5.7
+Gold (XAU/USD) signal guide bot — v5.9
+
+NEW in v5.9 — 3 scoped changes on top of v5.8, per request:
+
+  1. Pakistan local time: every signal's Time line now shows Pakistan
+     Standard Time first (e.g. "2026-10-03 18:45 PKT"), with UTC alongside
+     in parentheses for cross-checking against the chart. PKT is a fixed
+     UTC+5 year-round (no DST observed), so a plain timedelta offset is used
+     (to_pkt_str()) rather than a timezone-database lookup — this keeps the
+     bot dependency-free and correct regardless of what tz data (if any) is
+     installed on the GitHub Actions runner.
+  2. News source narrowed to one: TradingView. v5.6-v5.8 pulled from the
+     ForexFactory/Fair Economy JSON feed (plus mirrors) for the economic
+     calendar AND a separate Kitco RSS feed for raw headlines — two
+     different sites. Both are removed. is_news_window() / _fetch_news_events()
+     now query TradingView's economic-calendar endpoint
+     (economic-calendar.tradingview.com/events) exclusively for high-impact
+     USD events. Worth being direct about this like the v5.8 notes below
+     were about the old feed: this TradingView endpoint is unofficial/
+     undocumented (no public API docs, no key required) — it's used by
+     several independent open-source projects and worked in testing, but its
+     exact response schema isn't guaranteed stable, so the parser checks
+     multiple plausible field-name variants defensively and the whole call
+     is wrapped so a schema change or outage just silently skips the news
+     filter for that run rather than crashing the bot.
+  3. Short Telegram message: the long, line-by-line breakdown (structure,
+     CHOCH, FVG, liquidity, order blocks, premium/discount, 1H/4H/EMA200
+     trend, divergence, session, previous-session H/L, equal highs/lows,
+     OTE, fib, S/R, news caution, data status, disclaimer) is no longer what
+     gets sent to Telegram. All of that analysis still runs exactly as
+     before and still drives setup_strength/confluence — it's just captured
+     in a new `full_context` string that's printed to the run log (visible
+     in the GitHub Actions console and written to signal_log.csv's "flags"
+     field) instead of being texted to you. What actually arrives on
+     Telegram now is a short message: direction + strength, entry zone, SL,
+     TP1/TP2 with R-multiples, time (PKT + UTC), the signal candle's
+     OHLC, and — only when relevant — a single caution line for nearby
+     high-impact news or a conflicting higher-timeframe trend.
+
+--- v5.8 notes (unchanged) ---
+
+NEW in v5.8 — built against a specific feature checklist. Status of each:
+
+  1. Multi-timeframe trend (4H -> 1H -> 15m): ADDED. fetch_h4_trend() is a
+     genuine second HTF fetch (was only 1H before). Every trend/pullback
+     signal now shows "X/3 timeframes agree", and a 4H conflict both adds a
+     strength penalty AND caps the label at MEDIUM even if the raw score
+     would otherwise read STRONG (REQUIRE_4H_AGREEMENT_FOR_STRONG).
+  2. "Don't buy merely because an FVG exists": ALREADY TRUE BY DESIGN, now
+     stated explicitly. A signal only ever originates from one of the four
+     triggers (EMA cross, RSI bounce, pullback continuation, momentum spike)
+     — FVGs, order blocks, sweeps, S/R, fib, and now CHOCH/candle patterns
+     are confluence/strength inputs on a signal that already fired, never a
+     trigger by themselves. See the comment right above candle_patterns in
+     run() for where this is enforced.
+  3. Market structure — HH/HL/LH/LL, BOS, CHOCH: ADDED. detect_structure()
+     (existing) still gives the simple BOS check. NEW classify_market_
+     structure() builds the actual swing SEQUENCE and classifies it as an
+     uptrend/downtrend/ranging pattern, and separately flags a CHOCH — the
+     first break AGAINST that established pattern, distinct from a BOS
+     (continuation). A direction-matched CHOCH adds a confluence point.
+  4. EMA trend filter — EMA200 major, EMA50/20 momentum: ADDED. EMA20/50
+     already existed (momentum pair, used for overextension/pullback logic).
+     NEW: EMA200 on the working timeframe as a major-regime filter, with its
+     own (smaller) strength penalty on conflict.
+  5. Support & resistance — previous highs/lows, key H1/H4 levels: PARTIAL.
+     The existing S/R clustering (v5.4) already uses swing highs/lows on the
+     working timeframe. NEW: previous_session_high_low() adds the prior
+     Asian/London/NY session's high/low as an explicit reference level. True
+     H4-candle-level S/R (not just session boundaries) is a reasonable next
+     step but wasn't added here to keep scope controlled — the 4H trend
+     fetch (item 1) covers 4H DIRECTION, not yet 4H-candle S/R levels.
+  6. Liquidity detection — equal highs/lows, previous session high/low,
+     sweeps: equal highs/lows and sweeps already existed (v5.1-v5.4). NEW:
+     previous session high/low via previous_session_high_low().
+  7. FVG detection — bullish/bearish + retests: bullish/bearish unfilled FVG
+     detection already existed. Retest tracking was NOT added in v5.8 (noted
+     as a gap, not implemented) — flagged here rather than silently skipped.
+  8. ATR volatility filter — dynamic SL/TP: ALREADY TRUE. Every SL/TP path
+     (trend, pullback, spike) has been ATR-scaled since v5.1-v5.2; nothing
+     in the bot uses a fixed dollar distance. Confirmed, not changed.
+  9. News impact — "search top 3 live expert-prediction websites and
+     analyze with the live chart": NOT BUILT AS LITERALLY SPECIFIED, and
+     worth being direct about why. A plain Python script running on a 2-5
+     min cron job has no reliable, legitimate way to "read and analyze
+     expert predictions" from arbitrary websites in real time — that needs
+     either scraping gated editorial content (fragile, likely against those
+     sites' terms, breaks on every redesign) or a genuine LLM call per run
+     (a different, heavier architecture than this script). What WAS added
+     instead, as a responsible middle ground: (a) v5.6/v5.7 already pull a
+     REAL structured economic calendar (ForexFactory/Fair Economy, two
+     mirror endpoints) and that already scores into strength, not just a
+     calendar lookup; (b) NEW this version: 3 raw, unanalyzed headlines from
+     Kitco's public news RSS, shown as-is in every message for YOUR OWN
+     reading — explicitly not fed into the score or SL/TP logic, since doing
+     that without real analysis would be worse than not doing it at all.
+ 10. Session filter — Asian/London/NY, configurable: ADDED. SESSION_WINDOWS
+     is a plain dict of UTC hour ranges (edit directly to reconfigure). The
+     existing narrower "killzone" line (London/NY high-activity hours) is
+     kept as-is; SESSION_WINDOWS is the broader three-session system this
+     item asked for, used for the previous-session-high/low feature above.
+ 11. Candle confirmation — rejection, engulfing, strong close: ADDED.
+     classify_candle() checks the signal candle against the one before it
+     for bullish/bearish engulfing, rejection/pin-bar (long wick, small
+     body), and strong directional close. A match adds a confluence point;
+     absence is informational only (not a penalty), consistent with v5.5+'s
+     "flag, don't silently block" philosophy for everything that isn't a
+     hard data-quality gate.
+
+Net effect on the strength score: confluence denominator is now /8 (base 5,
+plus fib golden pocket from v5.7, plus CHOCH and candle-confirmation from
+v5.8), and STRENGTH_STRONG_MIN/MEDIUM_MIN were rescaled (6/3) to keep
+roughly the same strictness as before rather than getting easier to hit by
+accident as more factors were added.
+
+--- v5.7 notes (unchanged) ---
 
 NEW in v5.7 (built on v5.6):
 
@@ -201,6 +316,13 @@ SIGNAL_LOG_FILE = "signal_log.csv"  # NEW
 
 EMA_FAST = 20
 EMA_SLOW = 50
+EMA_MAJOR = 200                 # NEW v5.8: major-direction filter on the working (15m) timeframe,
+                                 # separate from the EMA20/50 momentum pair and separate from the
+                                 # 1H/4H HTF fetches — this answers "is 15m price even trading in a
+                                 # macro bullish/bearish regime", a different question than trend
+                                 # direction on a higher timeframe.
+MAJOR_TREND_CONFLICT_WEIGHT = 0.5   # strength penalty weight when a trend/pullback signal
+                                     # opposes the EMA200 side price is trading on
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30.0
 RSI_OVERBOUGHT = 70.0
@@ -211,6 +333,11 @@ TP_ATR_MULT = 2.5
 
 MOMENTUM_SPIKE_ATR_MULT = 2.0
 HTF_INTERVAL = "1h"
+HTF4_INTERVAL = "4h"            # NEW v5.8: second, higher timeframe for true 3-way MTF alignment
+REQUIRE_4H_AGREEMENT_FOR_STRONG = True  # NEW v5.8: 4H must agree for a signal to reach STRONG
+                                 # (not a suppression — a trend/pullback signal without 4H
+                                 # agreement is capped at MEDIUM, since "the big picture disagrees"
+                                 # is exactly the kind of risk the strength label exists to surface)
 
 NEWS_BUFFER_MIN = 30             # CHANGED v5.6: now the PRE-release window only
 NEWS_POST_BUFFER_MIN = 20        # NEW v5.6: separate, shorter POST-release window — the PCE
@@ -220,19 +347,19 @@ NEWS_PENALTY = 1.0               # NEW v5.6: a signal inside either window now c
                                   # strength point, not just a cosmetic caution line — a
                                   # technically sound MEDIUM setup should drop toward WEAK if
                                   # it's about to walk into a high-impact release
-NEWS_FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-# NEW v5.7: a second URL for resilience. Worth being honest about what this
-# is NOT — there is no genuinely independent, free, no-auth forex economic
-# calendar API to use as a true second source; every free alternative found
-# is either this same Fair Economy / ForexFactory data re-served, or a paid
-# scraper wrapping it. NEWS_FEED_URLS below is retry resilience (a second
-# endpoint serving the same underlying feed, so one mirror being down
-# doesn't silently disable the news check) — not source diversity.
-NEWS_FEED_URLS = [
-    NEWS_FEED_URL,
-    "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
-]
-NEWS_FEED_RETRIES = 2           # attempts per URL before moving to the next
+
+# CHANGED v5.9: switched from the ForexFactory/Fair Economy feed to
+# TradingView's economic-calendar endpoint, per request — one source
+# (TradingView) instead of pulling from several different news sites.
+# This is TradingView's real but UNOFFICIAL/undocumented calendar API (used
+# by several independent open-source projects — no login, no key), not a
+# scrape of the calendar's rendered HTML page. Being unofficial, it can
+# change without notice; the bot degrades gracefully (skips the news check
+# for that run) if it ever stops responding as expected.
+NEWS_FEED_URL = "https://economic-calendar.tradingview.com/events"
+NEWS_FEED_COUNTRY = "US"         # ISO country code filter — gold reacts mainly to USD data
+NEWS_FEED_URLS = [NEWS_FEED_URL]  # kept as a list for the existing retry loop below
+NEWS_FEED_RETRIES = 2           # attempts before giving up for this run
 NEWS_FEED_RETRY_DELAY_SEC = 2
 
 # ---- v5 data-integrity config ----
@@ -255,7 +382,7 @@ REOPEN_ACTION = "flag"          # "flag" | "suppress" | "off"
 
 MIN_CANDLE_RANGE_DOLLARS = 0.40 # a 15m gold candle with high-low below this is treated as flat/dead
 BREAK_GAP_MINUTES = 60          # a time gap larger than this between clean candles = session break
-MIN_CLEAN_CANDLES = EMA_SLOW + 10
+MIN_CLEAN_CANDLES = EMA_MAJOR + 10  # CHANGED v5.8 (was EMA_SLOW + 10): EMA200 needs more history
 MIN_SEGMENT_CANDLES = 8         # min candles since last break for premium/discount, OTE, equal levels
 SEGMENT_SHORT_ACTION = "flag"   # "flag" | "suppress" when segment is shorter than the minimum
 
@@ -352,8 +479,11 @@ DEDUP_OVERLAP_PCT = 0.5             # >= this fraction of zone overlap with an o
 # adjusted_score = confluence aligned (0-5, already includes the opposing-OB
 # penalty) minus 1 point each for: fighting a recent sweep, fighting a recent
 # reclaim, overextension, HTF conflict (trend/pullback triggers only).
-STRENGTH_STRONG_MIN = 4    # adjusted_score >= this -> STRONG (scale is now /6, see v5.7 note)
-STRENGTH_MEDIUM_MIN = 2    # adjusted_score >= this (and < STRONG_MIN) -> MEDIUM
+STRENGTH_STRONG_MIN = 6    # CHANGED v5.8 (was 4/6): adjusted_score >= this -> STRONG.
+                            # Scale is now /8 (base 5 + fib + CHOCH + candle-confirmation
+                            # standing points from v5.7/v5.8). Rescaled to keep roughly the
+                            # same strictness as the original 4/5 (80%) threshold: 6/8 = 75%.
+STRENGTH_MEDIUM_MIN = 3    # CHANGED v5.8 (was 2): 3/8 ≈ 37.5%, close to the original 2/5 (40%)
                             # below STRENGTH_MEDIUM_MIN -> WEAK
                             # CHANGED v5.7: confluence denominator is now 6, not 5 — a direction-
                             # matched Fibonacci golden-pocket (61.8-65%) retracement is a standing
@@ -376,6 +506,19 @@ LOG_FIELDS = [
 # ---------------------------------------------------------------------------
 def parse_dt(t):
     return datetime.datetime.fromisoformat(t).replace(tzinfo=datetime.timezone.utc)
+
+
+# NEW v5.9: Pakistan local time alongside UTC in every signal message, per
+# request. Pakistan Standard Time is a fixed UTC+5 year-round (no DST), so a
+# plain offset is used rather than a timezone database lookup — this keeps
+# the bot dependency-free and correct regardless of the host machine's
+# installed tz data.
+PKT_OFFSET = datetime.timedelta(hours=5)
+
+
+def to_pkt_str(dt_utc):
+    """dt_utc must be timezone-aware (UTC). Returns a 'YYYY-MM-DD HH:MM PKT' string."""
+    return (dt_utc + PKT_OFFSET).strftime("%Y-%m-%d %H:%M PKT")
 
 
 def fetch_candles(interval=None, outputsize=None):
@@ -674,6 +817,88 @@ def find_swing_levels(values, mode, lookback=5):
     return levels
 
 
+# NEW v5.8: same fractal scan as find_swing_levels, but keeping (index, value)
+# pairs in chronological order so the actual HH/HL/LH/LL SEQUENCE can be
+# built, not just a single most-recent swing compared to price.
+def find_swing_points(values, mode, lookback=5):
+    pts = []
+    for k in range(lookback, len(values) - lookback):
+        w = values[k - lookback:k + lookback + 1]
+        if mode == "high" and values[k] == max(w):
+            pts.append((k, values[k]))
+        elif mode == "low" and values[k] == min(w):
+            pts.append((k, values[k]))
+    return pts
+
+
+def classify_market_structure(highs, lows, closes, i, swing_lookback=5, lookback=150, n_swings=3):
+    """
+    NEW v5.8: builds the actual HH/HL or LH/LL swing sequence (the last
+    n_swings swing highs and lows), not just a single BOS check against the
+    most recent swing. Also separates CHOCH from BOS:
+      - BOS  = price continues in the direction the swing sequence already
+        established (e.g. closing above the last swing high during an
+        uptrend) — trend continuation, already covered by detect_structure().
+      - CHOCH = price breaks AGAINST the established sequence for the first
+        time (e.g. closing below the last swing low during an uptrend) —
+        this is the earlier, stronger reversal signal CHOCH is meant to be,
+        distinct from waiting for a full opposite-trend BOS later.
+    """
+    start = max(0, i - lookback)
+    sh_pts = find_swing_points(highs[start:i + 1], "high", swing_lookback)
+    sl_pts = find_swing_points(lows[start:i + 1], "low", swing_lookback)
+    if len(sh_pts) < 2 or len(sl_pts) < 2:
+        return {"pattern": "unclear", "choch_bull": False, "choch_bear": False,
+               "last_swing_high": None, "last_swing_low": None}
+
+    last_highs = [v for _, v in sh_pts[-n_swings:]]
+    last_lows = [v for _, v in sl_pts[-n_swings:]]
+    higher_highs = all(last_highs[k] > last_highs[k - 1] for k in range(1, len(last_highs)))
+    higher_lows = all(last_lows[k] > last_lows[k - 1] for k in range(1, len(last_lows)))
+    lower_highs = all(last_highs[k] < last_highs[k - 1] for k in range(1, len(last_highs)))
+    lower_lows = all(last_lows[k] < last_lows[k - 1] for k in range(1, len(last_lows)))
+
+    if higher_highs and higher_lows:
+        pattern = "uptrend (HH/HL)"
+    elif lower_highs and lower_lows:
+        pattern = "downtrend (LH/LL)"
+    else:
+        pattern = "ranging/mixed"
+
+    last_sh_val = sh_pts[-1][1]
+    last_sl_val = sl_pts[-1][1]
+    choch_bull = pattern.startswith("downtrend") and closes[i] > last_sh_val
+    choch_bear = pattern.startswith("uptrend") and closes[i] < last_sl_val
+    return {"pattern": pattern, "choch_bull": choch_bull, "choch_bear": choch_bear,
+           "last_swing_high": last_sh_val, "last_swing_low": last_sl_val}
+
+
+# NEW v5.8: named candle-confirmation patterns (engulfing, rejection/pin bar,
+# strong directional close), checked on the signal candle against the one
+# before it. Used as a confluence bonus, not a hard gate — consistent with
+# the rest of v5.5+'s "flag, don't silently block" approach.
+def classify_candle(o, h, l, c, prev_o, prev_h, prev_l, prev_c):
+    body = abs(c - o)
+    rng = h - l if h > l else 1e-9
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    patterns = []
+    if c > o and prev_c < prev_o and c >= prev_o and o <= prev_c:
+        patterns.append("bullish_engulfing")
+    if c < o and prev_c > prev_o and c <= prev_o and o >= prev_c:
+        patterns.append("bearish_engulfing")
+    if lower_wick / rng >= 0.6 and body / rng <= 0.35:
+        patterns.append("bullish_rejection")
+    if upper_wick / rng >= 0.6 and body / rng <= 0.35:
+        patterns.append("bearish_rejection")
+    if body / rng >= 0.7:
+        if c > o and (h - c) / rng <= 0.15:
+            patterns.append("strong_bullish_close")
+        elif c < o and (c - l) / rng <= 0.15:
+            patterns.append("strong_bearish_close")
+    return patterns
+
+
 def detect_structure(highs, lows, closes, i, lookback=5):
     sh_idx, sh_val = find_last_swing_high(highs, i - lookback, lookback)
     sl_idx, sl_val = find_last_swing_low(lows, i - lookback, lookback)
@@ -900,6 +1125,50 @@ def get_killzone(time_str):
     return None
 
 
+# NEW v5.8: broader, configurable session windows (UTC hours) — distinct from
+# the narrower "killzone" above, which marks the high-activity opening hours
+# used for a specific context line. These cover the full Asian/London/NY
+# sessions so a previous session's high/low can be identified as a liquidity
+# reference, per the request for session-based liquidity tracking.
+SESSION_WINDOWS = {
+    "Asian": (0, 7),
+    "London": (7, 12),
+    "New York": (12, 21),
+}
+
+
+def get_session_name(time_str, windows=SESSION_WINDOWS):
+    hour = datetime.datetime.fromisoformat(time_str).hour
+    for name, (start, end) in windows.items():
+        if start <= hour < end:
+            return name
+    return "off-session"
+
+
+def previous_session_high_low(times, highs, lows, i, windows=SESSION_WINDOWS):
+    """
+    Walks backward from the current candle to find the most recently
+    COMPLETED session (the session before the one the current candle is in),
+    and returns (session_name, high, low) for that full session — a liquidity
+    reference distinct from the swing-based S/R levels and equal highs/lows
+    already tracked.
+    """
+    cur_session = get_session_name(times[i], windows)
+    j = i
+    while j >= 0 and get_session_name(times[j], windows) == cur_session:
+        j -= 1
+    if j < 0:
+        return None, None, None
+    prev_session = get_session_name(times[j], windows)
+    hi = lo = None
+    k = j
+    while k >= 0 and get_session_name(times[k], windows) == prev_session:
+        hi = highs[k] if hi is None else max(hi, highs[k])
+        lo = lows[k] if lo is None else min(lo, lows[k])
+        k -= 1
+    return prev_session, hi, lo
+
+
 def compute_ote_zone(highs, lows, i, lookback=5):
     sh_idx, sh_val = find_last_swing_high(highs, i, lookback)
     sl_idx, sl_val = find_last_swing_low(lows, i, lookback)
@@ -936,9 +1205,40 @@ def fetch_htf_trend():
     return "up" if htf_fast[j] > htf_slow[j] else "down"
 
 
+# NEW v5.8: a genuine second, higher timeframe (4H) so "multi-timeframe
+# alignment" means three real timeframes (4H, 1H, working 15m), not just one
+# HTF filter relabeled. Same EMA20/50 cross logic as the 1H version, applied
+# to 4H candles.
+def fetch_h4_trend():
+    try:
+        h_t, h_o, h_h, h_l, h_c = fetch_candles(interval=HTF4_INTERVAL, outputsize=250)
+    except Exception as e:
+        print(f"4H fetch failed, skipping 4H context: {e}")
+        return None
+
+    h_t, h_o, h_h, h_l, h_c = drop_incomplete_candle(h_t, h_o, h_h, h_l, h_c, 240)
+    keep = [k for k, t in enumerate(h_t) if is_market_open(parse_dt(t))]
+    h_c = [h_c[k] for k in keep]
+
+    h4_fast = ema(h_c, EMA_FAST)
+    h4_slow = ema(h_c, EMA_SLOW)
+    j = len(h_c) - 1
+    if j < 0 or h4_fast[j] is None or h4_slow[j] is None:
+        return None
+    return "up" if h4_fast[j] > h4_slow[j] else "down"
+
+
+# CHANGED v5.9: headline fetch removed. Per request, news now comes from a
+# single source (TradingView's calendar) instead of pulling from several
+# different sites — the separate Kitco RSS headline feed from v5.8 is
+# dropped so there's exactly one news source in the bot, not two.
+
+
 def is_news_window(pre_buffer_minutes, post_buffer_minutes):
     """
     CHANGED v5.6: separate pre/post windows instead of one symmetric buffer.
+    CHANGED v5.9: reads TradingView's calendar event schema instead of the
+    ForexFactory/Fair Economy one (field names differ — see _fetch_news_events).
     Returns (in_window, title, phase) where phase is "pre" or "post" — a
     signal walking INTO a release (pre) and one issued shortly AFTER a print
     already happened (post, still volatile) are both real risks, but a
@@ -946,26 +1246,35 @@ def is_news_window(pre_buffer_minutes, post_buffer_minutes):
     reclaim elsewhere in the message) is informational context, not
     necessarily wrong — the caller still applies the strength penalty either
     way, but the phase is shown so you can read a post-news trend signal
-    (like today's SELL that rode the PCE reversal) differently from a
-    pre-news chase.
+    differently from a pre-news chase.
     """
     try:
         events = _fetch_news_events()
     except Exception as e:
-        print(f"News feed unavailable from all mirrors, skipping news filter this run: {e}")
+        print(f"News feed unavailable, skipping news filter this run: {e}")
         return False, "", None
 
     now = datetime.datetime.now(datetime.timezone.utc)
     for ev in events:
         try:
-            if ev.get("country") != "USD" or ev.get("impact") != "High":
+            # TradingView's schema: "importance" is -1/0/1 (1 = high), the
+            # event's display name is "title" or "indicator", and country is
+            # given as an ISO country code (e.g. "US"), not a currency code.
+            if ev.get("country") != NEWS_FEED_COUNTRY:
                 continue
-            ev_time = datetime.datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+            importance = ev.get("importance")
+            if importance != 1 and str(importance).lower() != "high":
+                continue
+            raw_date = ev.get("date") or ev.get("indicator_date")
+            if not raw_date:
+                continue
+            ev_time = datetime.datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
             delta_min = (now - ev_time).total_seconds() / 60
+            title = ev.get("title") or ev.get("indicator") or "high-impact USD event"
             if -pre_buffer_minutes <= delta_min <= 0:
-                return True, ev.get("title", "high-impact USD event"), "pre"
+                return True, title, "pre"
             if 0 < delta_min <= post_buffer_minutes:
-                return True, ev.get("title", "high-impact USD event"), "post"
+                return True, title, "post"
         except Exception:
             continue
     return False, "", None
@@ -973,23 +1282,41 @@ def is_news_window(pre_buffer_minutes, post_buffer_minutes):
 
 def _fetch_news_events():
     """
-    NEW v5.7: tries each URL in NEWS_FEED_URLS, with NEWS_FEED_RETRIES
-    attempts per URL before moving on, instead of giving up on the first
-    failed request to the single old endpoint. Raises the last error only
-    if every URL/attempt fails.
+    CHANGED v5.9: queries TradingView's calendar endpoint (one source) with
+    its own query params, instead of looping over multiple mirror URLs of
+    the old feed. Retries NEWS_FEED_RETRIES times before giving up. Raises
+    the last error if every attempt fails.
+    TradingView's response wraps the event list, typically under a "result"
+    or "data" key — both are checked since this is an unofficial, undocumented
+    endpoint and the exact wrapper key isn't guaranteed stable.
     """
     last_err = None
-    for url in NEWS_FEED_URLS:
-        for attempt in range(NEWS_FEED_RETRIES):
-            try:
-                resp = requests.get(url, timeout=15)
-                return resp.json()
-            except Exception as e:
-                last_err = e
-                if attempt < NEWS_FEED_RETRIES - 1:
-                    time.sleep(NEWS_FEED_RETRY_DELAY_SEC)
-        print(f"News feed mirror failed ({url}), trying next if available.")
+    for attempt in range(NEWS_FEED_RETRIES):
+        try:
+            resp = requests.get(
+                NEWS_FEED_URL,
+                params={"from": _utc_now_iso(), "to": _utc_plus_hours_iso(48),
+                       "countries": NEWS_FEED_COUNTRY},
+                timeout=15,
+            )
+            payload = resp.json()
+            if isinstance(payload, dict):
+                return payload.get("result") or payload.get("data") or []
+            return payload
+        except Exception as e:
+            last_err = e
+            if attempt < NEWS_FEED_RETRIES - 1:
+                time.sleep(NEWS_FEED_RETRY_DELAY_SEC)
     raise last_err
+
+
+def _utc_now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _utc_plus_hours_iso(hours):
+    t = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=hours)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def compute_confluence(signal, bos_bull, bos_bear, nearest_fvg, order_block,
@@ -1292,6 +1619,7 @@ def run(state, now_utc):
 
     ema_fast = ema(closes, EMA_FAST)
     ema_slow = ema(closes, EMA_SLOW)
+    ema_major = ema(closes, EMA_MAJOR)  # NEW v5.8
     rsi_vals = rsi(closes, RSI_PERIOD)
     atr_vals = atr(highs, lows, closes, ATR_PERIOD, breaks)
     prev = i - 1
@@ -1536,6 +1864,34 @@ def run(state, now_utc):
                 note += " — but 15m is already turning this way; treated as a likely-lagging 1H read"
             flags.append(note)
 
+    # NEW v5.8: genuine 3-way multi-timeframe alignment (4H -> 1H -> 15m),
+    # not just the single 1H HTF filter from earlier versions.
+    h4_trend = fetch_h4_trend()
+    h4_conflict = False
+    if trigger_type in ("trend", "pullback") and h4_trend is not None:
+        h4_conflict = (h4_trend == "up" and signal == -1) or (h4_trend == "down" and signal == 1)
+        if h4_conflict:
+            flags.append(f"{direction} conflicts with 4H trend ({h4_trend}) — bigger-picture disagrees")
+
+    ltf_15m_trend = None
+    if ema_fast[i] is not None and ema_slow[i] is not None:
+        ltf_15m_trend = "up" if ema_fast[i] > ema_slow[i] else "down"
+    mtf_agree_count = sum([
+        1 if h4_trend == ("up" if signal == 1 else "down") else 0,
+        1 if htf_trend == ("up" if signal == 1 else "down") else 0,
+        1 if ltf_15m_trend == ("up" if signal == 1 else "down") else 0,
+    ])
+
+    # NEW v5.8: EMA200 major-direction filter on the working timeframe itself
+    # — a different question than the 1H/4H fetches ("is price even trading
+    # on the bullish or bearish side of its own long-run average right now").
+    major_trend_conflict = False
+    if ema_major[i] is not None and trigger_type in ("trend", "pullback"):
+        major_trend = "up" if closes[i] > ema_major[i] else "down"
+        major_trend_conflict = (major_trend == "up" and signal == -1) or (major_trend == "down" and signal == 1)
+        if major_trend_conflict:
+            flags.append(f"{direction} is on the wrong side of EMA{EMA_MAJOR} ({major_trend} regime)")
+
     close_now = closes[i]
     half_width = atr_now * ENTRY_RANGE_ATR_MULT
     entry_low, entry_high = close_now - half_width, close_now + half_width
@@ -1577,6 +1933,25 @@ def run(state, now_utc):
         structure_note = "bearish break of structure (price closed below recent swing low)"
     else:
         structure_note = "no confirmed break of recent structure yet"
+
+    # NEW v5.8: full HH/HL or LH/LL swing-sequence pattern, plus CHOCH — the
+    # first break AGAINST that pattern, which is a distinct and earlier
+    # signal than the continuation BOS check above.
+    mkt_structure = classify_market_structure(s_h, s_l, s_c, s_i)
+    choch_match = (mkt_structure["choch_bull"] and signal == 1) or (mkt_structure["choch_bear"] and signal == -1)
+
+    # NEW v5.8: named candle-confirmation pattern on the signal candle vs the
+    # one before it (engulfing, rejection/pin bar, strong directional close).
+    # "Entry principle" note: this and everything else in this block is
+    # CONTEXT for a trigger that already fired (EMA cross/RSI/pullback/spike)
+    # — none of these, FVG included, are ever used to originate a signal by
+    # themselves. See the v5.8 docstring for this explicitly.
+    candle_patterns = classify_candle(s_o[s_i], s_h[s_i], s_l[s_i], s_c[s_i],
+                                      s_o[s_i - 1], s_h[s_i - 1], s_l[s_i - 1], s_c[s_i - 1])
+    candle_confirms = ((signal == 1 and any(p.startswith("bullish") or p == "strong_bullish_close"
+                                            for p in candle_patterns)) or
+                       (signal == -1 and any(p.startswith("bearish") or p == "strong_bearish_close"
+                                             for p in candle_patterns)))
 
     def relevant_zone(z):
         return z is not None and zone_distance(close_now, z["low"], z["high"]) <= MAX_CONTEXT_DISTANCE_ATR * atr_now
@@ -1638,33 +2013,46 @@ def run(state, now_utc):
     aligned, total = compute_confluence(
         signal, bos_bull, bos_bear, nearest_fvg, order_block, swept_high, swept_low, htf_trend
     )
-    total += 1  # NEW v5.7: denominator now 6 — fib golden pocket is a standing possible point
+    # CHANGED v5.8: denominator now 8 — fib golden pocket, CHOCH (direction-
+    # matched), and candle confirmation are each a standing possible point on
+    # top of the base 5, in addition to the fib point added in v5.7.
+    total += 1  # fib golden pocket (v5.7)
     if fib_golden_pocket:
-        aligned += 1  # golden-pocket (61.8-65%) retracement bonus, direction-matched
+        aligned += 1
+    total += 1  # NEW v5.8: CHOCH in the signal's own direction
+    if choch_match:
+        aligned += 1
+    total += 1  # NEW v5.8: named candle-confirmation pattern matching the signal
+    if candle_confirms:
+        aligned += 1
     if aligned < MIN_CONFLUENCE_TO_SEND:
         print(f"Confluence {aligned}/{total} below MIN_CONFLUENCE_TO_SEND={MIN_CONFLUENCE_TO_SEND} — suppressing.")
         return
 
-    # NEW v5.5/CHANGED v5.6: setup-strength label — replaces the old
+    # NEW v5.5/CHANGED v5.6/v5.8: setup-strength label — replaces the old
     # send/no-send tier. Every signal is sent now; this tells you how much to
-    # trust it. adjusted_score = confluence (0-5, already includes the
-    # opposing-OB penalty from v5.4) minus weighted penalties:
+    # trust it. adjusted_score = confluence (now /8, see above) minus
+    # weighted penalties:
     #   - overextended (EMA-distance, trend/pullback triggers): 1.0
-    #   - spike-candle overextension (spike triggers only, NEW v5.6): 1.0
-    #   - fighting a recent sweep (NOT stale, NEW v5.6 staleness check): 1.0
+    #   - spike-candle overextension (spike triggers only, v5.6): 1.0
+    #   - fighting a recent sweep (not stale, v5.6 staleness check): 1.0
     #   - fighting a recent structure reclaim: 1.0
-    #   - HTF conflict: 1.0 normally, 0.5 if the 15m is already turning the
-    #     signal's way (NEW v5.6 — the 1H read is likely lagging, not wrong)
-    #   - cooldown/cap flag (NEW v5.6): 0.5 — today's data showed a capped,
-    #     late-in-window signal was also the one clear loss in its batch
+    #   - 1H conflict: 1.0 normally, 0.5 if the 15m is already turning the
+    #     signal's way (v5.6 — the 1H read is likely lagging, not wrong)
+    #   - 4H conflict (NEW v5.8): 1.0 — a real "bigger picture disagrees" cost
+    #   - EMA200 regime conflict (NEW v5.8): MAJOR_TREND_CONFLICT_WEIGHT (0.5)
+    #   - cooldown/cap flag (v5.6): 0.5
+    #   - news window (v5.6): NEWS_PENALTY (1.0)
     strength_penalty = (
         (1.0 if overextended_flag else 0)
         + (1.0 if spike_overextended_flag else 0)
         + (1.0 if fights_sweep else 0)
         + (1.0 if fights_reclaim else 0)
         + htf_conflict_weight
+        + (1.0 if h4_conflict else 0)
+        + (MAJOR_TREND_CONFLICT_WEIGHT if major_trend_conflict else 0)
         + (0.5 if cooldown_flag else 0)
-        + (NEWS_PENALTY if news_flag else 0)  # NEW v5.6: real penalty, not just cosmetic
+        + (NEWS_PENALTY if news_flag else 0)
     )
     adjusted_score = max(aligned - strength_penalty, 0)
     if adjusted_score >= STRENGTH_STRONG_MIN:
@@ -1673,6 +2061,12 @@ def run(state, now_utc):
         setup_strength = "MEDIUM"
     else:
         setup_strength = "WEAK"
+    # NEW v5.8: a STRONG label still requires the 4H not to actively disagree
+    # — "every lower-timeframe factor lines up but the bigger picture is
+    # against it" shouldn't read as the bot's highest-confidence tier.
+    if setup_strength == "STRONG" and h4_conflict and REQUIRE_4H_AGREEMENT_FOR_STRONG:
+        setup_strength = "MEDIUM"
+        flags.append("capped at MEDIUM: 4H trend disagrees, so not called STRONG despite the score")
     confidence_tier = setup_strength  # kept for CSV/state field-name continuity
 
     # ---- NEW: targets ----
@@ -1696,7 +2090,14 @@ def run(state, now_utc):
 
     trigger_label = "trend-continuation pullback" if pullback else trigger_type
     strength_emoji = {"STRONG": "🟢", "MEDIUM": "🟡", "WEAK": "🔴"}[setup_strength]
-    message = (
+
+    # CHANGED v5.9: all the SMC/ICT analysis above still runs and still
+    # drives the strength score exactly as before — only the OUTGOING
+    # MESSAGE is now short, per request. The full breakdown is kept as
+    # `full_context` and printed to the run log (GitHub Actions console
+    # output) and written to signal_log.csv's "flags" field for later
+    # review, but it is NOT what gets sent to Telegram.
+    full_context = (
         f"{strength_emoji} Setup strength: {setup_strength}  (confluence {aligned}/{total}, "
         f"adjusted {adjusted_score:g} after {strength_penalty:g} caution-flag weight)\n\n"
         f"XAU/USD {direction} zone{counter_trend_note}\n"
@@ -1709,67 +2110,112 @@ def run(state, now_utc):
         f"Confluence: {aligned}/{total} concepts aligned\n"
     )
     if flags:
-        message += "Flags: " + "; ".join(flags) + "\n"
+        full_context += "Flags: " + "; ".join(flags) + "\n"
     if pullback:
-        message += (f"Pullback: bounced {pullback['bounce']:.1f} pts ({pullback['retrace'] * 100:.0f}% of the "
+        full_context += (f"Pullback: bounced {pullback['bounce']:.1f} pts ({pullback['retrace'] * 100:.0f}% of the "
                     f"{pullback['leg_height']:.1f}-pt leg), rejected near {pullback['pb_extreme']:.2f}; "
                     f"SL sits just beyond that level\n")
-    message += f"\nStructure: {structure_note}\n"
+    full_context += f"\nStructure: {structure_note}\n"
+    # NEW v5.8: HH/HL or LH/LL pattern and CHOCH, shown distinctly from the
+    # BOS line above.
+    full_context += f"Swing pattern: {mkt_structure['pattern']}\n"
+    if choch_match:
+        choch_dir = "bullish" if signal == 1 else "bearish"
+        full_context += f"⚡ CHOCH: {choch_dir} change of character — first break against the prior swing pattern\n"
+    if candle_confirms:
+        full_context += f"Candle confirmation: {', '.join(candle_patterns)}\n"
     if nearest_fvg:
-        message += (f"Nearby unfilled FVG ({nearest_fvg['type']}): "
+        full_context += (f"Nearby unfilled FVG ({nearest_fvg['type']}): "
                     f"{nearest_fvg['low']:.2f} - {nearest_fvg['high']:.2f}\n")
     if sweep_note:
-        message += f"Liquidity: {sweep_note}\n"
+        full_context += f"Liquidity: {sweep_note}\n"
     if order_block:
         ob_aligned = (order_block["type"] == "bullish") == (signal == 1)
         ob_label = "aligned" if ob_aligned else "opposing - possible support/target"
-        message += (f"Order block ({order_block['type']}, {ob_label}): "
+        full_context += (f"Order block ({order_block['type']}, {ob_label}): "
                     f"{order_block['low']:.2f} - {order_block['high']:.2f}\n")
     if smc_range_ok:
         zone_label = ("premium (upper half of session range)" if close_now > seg_mid
                       else "discount (lower half of session range)")
-        message += f"Price sits in {zone_label} (range {seg_low:.2f} - {seg_high:.2f})\n"
+        full_context += f"Price sits in {zone_label} (range {seg_low:.2f} - {seg_high:.2f})\n"
     if htf_trend:
         agreement = ("agrees with" if (htf_trend == "up" and signal == 1) or (htf_trend == "down" and signal == -1)
                      else "conflicts with")
-        message += f"1H trend: {htf_trend} ({agreement} this signal)\n"
+        full_context += f"1H trend: {htf_trend} ({agreement} this signal)\n"
+    if h4_trend:
+        agreement4 = ("agrees with" if (h4_trend == "up" and signal == 1) or (h4_trend == "down" and signal == -1)
+                     else "conflicts with")
+        full_context += f"4H trend: {h4_trend} ({agreement4} this signal)\n"
+    if ltf_15m_trend:
+        full_context += f"Multi-timeframe alignment: {mtf_agree_count}/3 timeframes agree with this {direction}\n"
+    if ema_major[i] is not None:
+        major_trend_label = "up" if closes[i] > ema_major[i] else "down"
+        full_context += f"EMA{EMA_MAJOR} major regime: {major_trend_label}\n"
     if ltf_divergence_note:
-        message += f"⚠️ Divergence: {ltf_divergence_note}\n"
+        full_context += f"⚠️ Divergence: {ltf_divergence_note}\n"
     killzone = get_killzone(times[i])
-    message += f"Session: {killzone}\n" if killzone else "Session: outside main London/New York killzones\n"
+    full_context += f"Session: {killzone}\n" if killzone else "Session: outside main London/New York killzones\n"
+    prev_sess_name, prev_sess_hi, prev_sess_lo = previous_session_high_low(times, s_h, s_l, s_i)
+    if prev_sess_name:
+        full_context += (f"Previous session ({prev_sess_name}) high/low: "
+                    f"{prev_sess_hi:.2f} / {prev_sess_lo:.2f}\n")
     if eq_high is not None:
-        message += f"Equal highs (liquidity pool) near {eq_high:.2f}\n"
+        full_context += f"Equal highs (liquidity pool) near {eq_high:.2f}\n"
     if eq_low is not None:
-        message += f"Equal lows (liquidity pool) near {eq_low:.2f}\n"
+        full_context += f"Equal lows (liquidity pool) near {eq_low:.2f}\n"
     if ote:
-        message += f"OTE zone {ote['type']}: {ote['low']:.2f} - {ote['high']:.2f}\n"
+        full_context += f"OTE zone {ote['type']}: {ote['low']:.2f} - {ote['high']:.2f}\n"
     if fib:
         pct_str = ", ".join(f"{int(r*1000)/10:g}%: {lvl:.2f}" for r, lvl in sorted(fib["levels"].items()) if r < 1)
-        message += (f"Fibonacci ({fib['direction']} leg {fib['leg_low']:.2f}-{fib['leg_high']:.2f}): "
+        full_context += (f"Fibonacci ({fib['direction']} leg {fib['leg_low']:.2f}-{fib['leg_high']:.2f}): "
                     f"{pct_str}\n")
         if fib_near:
             pocket_note = " — GOLDEN POCKET" if fib_golden_pocket else ""
-            message += f"Price near {fib_near[0]*100:g}% fib level ({fib_near[1]:.2f}){pocket_note}\n"
+            full_context += f"Price near {fib_near[0]*100:g}% fib level ({fib_near[1]:.2f}){pocket_note}\n"
     # NEW v5.4: nearest S/R level, shown as context
     nearest_lvl = nearest_sr_level(sr_levels, close_now, MAX_CONTEXT_DISTANCE_ATR, atr_now)
     if nearest_lvl:
         role = "resistance" if nearest_lvl["price"] > close_now else "support"
-        message += f"Nearby S/R level ({role}, {nearest_lvl['touches']} touches): {nearest_lvl['price']:.2f}\n"
+        full_context += f"Nearby S/R level ({role}, {nearest_lvl['touches']} touches): {nearest_lvl['price']:.2f}\n"
     if sr_reclaim:
-        message += (f"Structure reclaim: price reclaimed {sr_reclaim['level']:.2f} "
+        full_context += (f"Structure reclaim: price reclaimed {sr_reclaim['level']:.2f} "
                     f"({sr_reclaim['direction']}) recently\n")
     if news_flag:
         phase_note = ("releasing within the next "
                       f"{NEWS_BUFFER_MIN} min" if news_phase == "pre" else
                       f"released within the last {NEWS_POST_BUFFER_MIN} min — volatility may still be elevated")
-        message += f"\n⚠️ CAUTION: high-impact USD news — {news_title} ({phase_note})\n"
-    message += "\nData status: live (session, freshness, ATR, range and clean-candle checks passed)\n"
-    message += (
+        full_context += f"\n⚠️ CAUTION: high-impact USD news — {news_title} ({phase_note})\n"
+    full_context += "\nData status: live (session, freshness, ATR, range and clean-candle checks passed)\n"
+    full_context += (
         "\n(Guidance only — structure/FVG/order blocks/sweeps are added context, "
         "not a prediction. No trade placed automatically.)"
     )
 
-    print(message)
+    # NEW v5.9: the actual Telegram message — short, per request. Just
+    # direction, strength, entry/SL/TP, time (UTC + Pakistan local), and the
+    # signal candle's OHLC. Everything above still computed and still drives
+    # setup_strength; it's just not sent line-by-line anymore.
+    candle_utc = parse_dt(times[i]) + datetime.timedelta(minutes=INTERVAL_MINUTES)  # candle CLOSE time
+    pkt_str = to_pkt_str(candle_utc)
+    utc_str = candle_utc.strftime("%Y-%m-%d %H:%M UTC")
+    news_short = ""
+    if news_flag:
+        news_short = f"\n⚠️ High-impact USD news nearby: {news_title}"
+    one_liner_flags = ""
+    if fights_sweep or fights_reclaim or htf_conflict or h4_conflict or major_trend_conflict:
+        one_liner_flags = "\n⚠️ Against higher-timeframe trend — size/trade with caution"
+
+    message = (
+        f"{strength_emoji} {direction} XAU/USD — {setup_strength}{counter_trend_note}\n"
+        f"Entry: {entry_low:.2f} - {entry_high:.2f}\n"
+        f"SL: {sl:.2f}\n"
+        f"TP1: {tp1:.2f} ({rr1:.1f}R)   TP2: {tp2:.2f} ({rr2:.1f}R)\n"
+        f"Time: {pkt_str}  ({utc_str})\n"
+        f"Candle O/H/L/C: {opens[i]:.2f}/{highs[i]:.2f}/{lows[i]:.2f}/{closes[i]:.2f}"
+        f"{news_short}{one_liner_flags}"
+    )
+
+    print(full_context)
     # CHANGED v5.5: every signal is sent now — nothing is withheld based on
     # setup strength. The WEAK/MEDIUM/STRONG label above is for your own
     # manual filtering, not the bot's.
