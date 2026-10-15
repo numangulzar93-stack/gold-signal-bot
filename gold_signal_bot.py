@@ -1,5 +1,14 @@
 """
-Gold (XAU/USD) signal guide bot — v5.9
+Gold (XAU/USD) signal guide bot — v6.0
+
+NEW in v6.0 — QUALITY GATE (based on the backtest of 176 signals / 51 days):
+  The old trigger set won ~32% vs 37.5% break-even; signals where the 1H
+  trend DISAGREED were the worst. Now a signal is only SENT to Telegram if
+  the 1H trend agrees with it and the 4H trend does not conflict. Every other
+  signal is still computed, logged to signal_log.csv and paper-tracked
+  silently (no message) so we can verify with real results whether the
+  filter helps. Set QUALITY_GATE = False to go back to sending everything.
+
 
 NEW in v5.9 — 3 scoped changes on top of v5.8, per request:
 
@@ -417,6 +426,7 @@ LATENCY_SUPPRESS_MIN = 20
 LATENCY_ACTION = "flag"         # NEW v5.5: "flag" | "suppress" — was a hard suppress pre-v5.5
 TRACK_MAX_CANDLES = 96          # 24h of 15m candles, then a tracked signal expires
 SEND_OUTCOME_MESSAGES = True
+QUALITY_GATE = True   # v6.0: only send signals where 1H agrees and 4H does not conflict
 
 # ---- NEW v5.5: HTF (1H) conflict for trend/pullback triggers ----
 HTF_CONFLICT_ACTION = "flag"    # CHANGED v5.5 (was a hard suppress via
@@ -1601,7 +1611,7 @@ def run(state, now_utc):
         })
         # CHANGED v5.5: every signal is sent now, so every result has a
         # matching entry alert — no need to gate this by tier anymore.
-        if SEND_OUTCOME_MESSAGES:
+        if SEND_OUTCOME_MESSAGES and not s.get("silent"):
             send_telegram(
                 f"Result: {s['direction']} @ {s['entry']:.2f} ({s['candle_time']} UTC) -> {s['outcome']} "
                 f"after {s.get('candles_seen', '?')} candles\n{tally_line(state)}"
@@ -2219,7 +2229,11 @@ def run(state, now_utc):
     # CHANGED v5.5: every signal is sent now — nothing is withheld based on
     # setup strength. The WEAK/MEDIUM/STRONG label above is for your own
     # manual filtering, not the bot's.
-    send_telegram(message)
+    gate_pass = (not QUALITY_GATE) or (htf_trend is not None and not htf_conflict and not h4_conflict)
+    if gate_pass:
+        send_telegram(message)
+    else:
+        print("QUALITY GATE: not sent (1H/4H disagree or 1H unknown) — logged and tracked silently.")
 
     # ---- state, cooldown history, tracker, log ----
     state["last_alert_time"] = candle_time
@@ -2230,11 +2244,13 @@ def run(state, now_utc):
         "entry": close_now, "sl": sl, "tp1": tp1, "tp2": tp2,
         "confluence": f"{aligned}/{total}", "confidence_tier": confidence_tier,
         "stage": 0, "candles_seen": 0, "last_checked": candle_time,
+        "silent": not gate_pass,
     })
     append_log({
         "event": "signal", "time_utc": candle_time, "direction": direction, "trigger": trigger_type,
         "entry": f"{close_now:.2f}", "sl": f"{sl:.2f}", "tp1": f"{tp1:.2f}", "tp2": f"{tp2:.2f}",
-        "confluence": f"{aligned}/{total}", "confidence_tier": confidence_tier,
+        "confluence": f"{aligned}/{total}",
+        "confidence_tier": confidence_tier + ("" if gate_pass else "-SILENT"),
         "latency_min": f"{max(latency_min, 0):.0f}", "flags": " | ".join(flags),
     })
 
